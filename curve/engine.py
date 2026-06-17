@@ -34,6 +34,21 @@ def _extract_text(message: Dict[str, Any]) -> str:
     return "\n".join(parts).strip()
 
 
+def _empty_usage() -> Dict[str, int]:
+    return {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+
+
+def _accumulate_usage(total: Dict[str, int], response: Dict[str, Any]) -> None:
+    """Add one Converse response's ``usage`` block into the running total.
+
+    A tool-using turn makes multiple converse calls; usage must be summed across
+    ALL of them, not read off the last call (which would undercount).
+    """
+    usage = response.get("usage") or {}
+    for key in ("inputTokens", "outputTokens", "totalTokens"):
+        total[key] += usage.get(key, 0)
+
+
 def run_curve_turn(
     question: str,
     *,
@@ -61,8 +76,9 @@ def run_curve_turn(
         verbose: Print per-iteration trace (used by the CLI's dev view).
 
     Returns:
-        ``{"text", "tool_trace", "stop_reason", "iterations", "messages"}`` where
-        ``tool_trace`` is the ordered list of tool names the model called.
+        ``{"text", "tool_trace", "stop_reason", "iterations", "usage", "messages"}``.
+        ``tool_trace`` is the ordered list of tool names the model called; ``usage``
+        is the token usage summed across every converse call in this turn.
     """
     if wrapper is None:
         wrapper = CurveBedrockWrapper(
@@ -81,11 +97,14 @@ def run_curve_turn(
         {"role": "user", "content": [{"text": question}]}
     ]
     tool_trace: List[str] = []
+    usage = _empty_usage()
 
     for iteration in range(max_iterations):
         response = wrapper.converse(
             messages=messages, system=system, tool_config=tool_config
         )
+        # Sum usage across every converse call in this turn (not just the last).
+        _accumulate_usage(usage, response)
         assistant_message = response["output"]["message"]
         # Append the assistant message VERBATIM — this preserves reasoningContent
         # (thinking) blocks in order, which Bedrock requires on the next turn.
@@ -106,6 +125,7 @@ def run_curve_turn(
                 "tool_trace": tool_trace,
                 "stop_reason": stop_reason,
                 "iterations": iteration + 1,
+                "usage": usage,
                 "messages": messages,
             }
 
@@ -142,5 +162,6 @@ def run_curve_turn(
         "tool_trace": tool_trace,
         "stop_reason": "max_iterations",
         "iterations": max_iterations,
+        "usage": usage,
         "messages": messages,
     }

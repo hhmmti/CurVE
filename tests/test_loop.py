@@ -52,7 +52,17 @@ def _reasoning_block(text="Routing to the production history tool."):
     }
 
 
-def _tool_use_turn(name, tool_use_id="tu-1", tool_input=None, with_thinking=True):
+def _usage(in_tokens, out_tokens):
+    return {
+        "inputTokens": in_tokens,
+        "outputTokens": out_tokens,
+        "totalTokens": in_tokens + out_tokens,
+    }
+
+
+def _tool_use_turn(
+    name, tool_use_id="tu-1", tool_input=None, with_thinking=True, usage=None
+):
     content = []
     if with_thinking:
         content.append(_reasoning_block())
@@ -60,13 +70,18 @@ def _tool_use_turn(name, tool_use_id="tu-1", tool_input=None, with_thinking=True
     content.append(
         {"toolUse": {"toolUseId": tool_use_id, "name": name, "input": tool_input or {"well_id": "W-12"}}}
     )
-    return {"output": {"message": {"role": "assistant", "content": content}}, "stopReason": "tool_use"}
+    return {
+        "output": {"message": {"role": "assistant", "content": content}},
+        "stopReason": "tool_use",
+        "usage": usage or _usage(100, 20),
+    }
 
 
-def _end_turn(text="Here is the answer."):
+def _end_turn(text="Here is the answer.", usage=None):
     return {
         "output": {"message": {"role": "assistant", "content": [{"text": text}]}},
         "stopReason": "end_turn",
+        "usage": usage or _usage(150, 30),
     }
 
 
@@ -82,6 +97,23 @@ def test_routes_runs_tool_and_terminates():
     assert result["iterations"] == 2
     # Two converse calls: initial + after the toolResult.
     assert len(wrapper.calls) == 2
+
+
+def test_usage_summed_across_multi_call_turn():
+    # A tool-using turn = 2 converse calls. Usage must SUM across both, not be
+    # read off the last call only (the undercount trap).
+    wrapper = ScriptedWrapper(
+        [
+            _tool_use_turn("production_history", usage=_usage(100, 20)),
+            _end_turn(usage=_usage(150, 30)),
+        ]
+    )
+    result = run_curve_turn("How has W-12 produced?", wrapper=wrapper)
+
+    usage = result["usage"]
+    assert usage["inputTokens"] == 250  # 100 + 150, not just 150
+    assert usage["outputTokens"] == 50  # 20 + 30
+    assert usage["totalTokens"] == 300  # 120 + 180
 
 
 def test_tool_result_appended_between_turns():
