@@ -1,0 +1,5 @@
+# CurVE M1 dependencies.
+# boto3 recent enough for the Bedrock Converse API + the Claude Sonnet 4.6
+# inference profile (us.anthropic.claude-sonnet-4-6).
+boto3>=1.35.0
+pytest>=7.4
