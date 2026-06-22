@@ -1,5 +1,9 @@
-# CurVE M1 dependencies.
+# CurVE dependencies (M1 + M2 core).
 # boto3 recent enough for the Bedrock Converse API + the Claude Sonnet 4.6
 # inference profile (us.anthropic.claude-sonnet-4-6).
 boto3>=1.35.0
+# M2: real Athena fetch (awswrangler) + vendored compute/plotting (pandas, plotly).
+awswrangler>=3.0
+pandas>=2.0
+plotly>=5.0
 pytest>=7.4

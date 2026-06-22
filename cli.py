@@ -1,26 +1,36 @@
-"""CurVE M1 CLI — drive the hand-rolled tool loop against live Bedrock.
+"""CurVE CLI — drive the hand-rolled tool loop against live Bedrock.
 
-Two modes:
+Three modes:
   * interactive (default): type a question → runs ``run_curve_turn`` against live
     Bedrock → prints the answer and the ordered tool_trace.
   * batch (``--batch``): runs the placeholder ``TEST_QUESTIONS`` fixture, printing
     expected-vs-actual tool per question.
+  * session ask (``--org`` + ``--well`` + ``--ask``, M2): set up a session for a
+    real (org, well), ask a ``production_history`` question, and print the narration
+    (with trust basis), the ``values``, the ``trust_label``, and confirm a
+    ``figure_ref`` was produced (optionally write the Plotly figure to HTML, since
+    the CLI can't render it inline).
 
-Both modes call the **shipped** ``run_curve_turn`` — the CLI does not reimplement
-the loop. Live Bedrock requires AWS creds; run ``aws sso login --profile roam-ai``
-first.
+All modes call the **shipped** ``run_curve_turn`` — the CLI does not reimplement the
+loop. Live Bedrock + Athena require AWS creds; run ``aws sso login --profile
+roam-ai`` first.
 
 Usage:
     python cli.py                          # interactive, profile roam-ai
     python cli.py --batch                  # routing batch over the fixture
     python cli.py --profile roam-ai --region us-east-1
     python cli.py --no-thinking            # disable extended thinking
+    # M2 session ask (real telemetry+production for one well):
+    python cli.py --org <ORG_ID> --well <WELL_ID> \\
+        --ask "How has this well produced over the last 90 days?" \\
+        --html-out /tmp/production_history.html
 """
 
 import argparse
 import sys
 
 from curve.engine import run_curve_turn
+from curve.session import new_session_record, save_session
 from curve.test_questions import TEST_QUESTIONS
 from curve.wrapper import CURVE_DEFAULT_PROFILE, CURVE_REGION
 
@@ -107,8 +117,67 @@ def _run_interactive(profile_name: str, region_name: str, enable_thinking: bool)
     return 0
 
 
+def _run_session_ask(
+    organization_id: str,
+    well_id: str,
+    question: str,
+    profile_name: str,
+    region_name: str,
+    enable_thinking: bool,
+    html_out: str = None,
+) -> int:
+    """M2: set up a session for (org, well) and ask one production_history question."""
+    session = save_session(
+        new_session_record(
+            session_id=f"cli-{organization_id}-{well_id}",
+            organization_id=organization_id,
+            well_id=well_id,
+        )
+    )
+    print("CurVE M2 — session ask (production_history, real telemetry+production)")
+    print(f"profile={profile_name}  region={region_name}  thinking={enable_thinking}")
+    print(f"org={organization_id}  well={well_id}")
+    print(f"question: {question}\n")
+
+    result = run_curve_turn(
+        question,
+        session=session,
+        profile_name=profile_name,
+        region_name=region_name,
+        enable_thinking=enable_thinking,
+        verbose=True,
+    )
+
+    print(f"\ntool_trace: {result['tool_trace']}")
+    print(f"stop_reason: {result['stop_reason']}  iterations: {result['iterations']}")
+    print(_format_usage("turn usage", result["usage"]))
+
+    # Surface each tool's envelope: values, trust_label, flags, and the figure_ref.
+    for output in result.get("tool_outputs", []):
+        env = output["result"]
+        if not isinstance(env, dict):
+            continue
+        print(f"\n--- tool: {output['name']} ---")
+        print(f"status:      {env.get('status')}")
+        print(f"trust_label: {env.get('trust_label')}")
+        print(f"flags:       {env.get('flags')}")
+        print(f"values:      {env.get('values')}")
+        figure_ref = env.get("figure_ref")
+        figure = env.get("figure")
+        if figure_ref:
+            print(f"figure_ref:  {figure_ref}  (figure produced: {figure is not None})")
+            if html_out and figure is not None:
+                figure.write_html(html_out)
+                print(f"figure written to: {html_out}")
+        else:
+            print("figure_ref:  (none — tool was blocked/unavailable)")
+
+    print(f"\n=== narration ===\n{result['text']}\n")
+    return 0
+
+
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="CurVE M1 tool-loop CLI.")
+    parser = argparse.ArgumentParser(description="CurVE tool-loop CLI.")
     parser.add_argument(
         "--profile",
         default=CURVE_DEFAULT_PROFILE,
@@ -125,9 +194,30 @@ def main(argv=None) -> int:
         action="store_true",
         help="Disable extended thinking (default: enabled).",
     )
+    # M2 session-ask mode.
+    parser.add_argument("--org", help="organization_id for the session (M2 ask mode).")
+    parser.add_argument("--well", help="well_id for the session (M2 ask mode).")
+    parser.add_argument(
+        "--ask", help="A production_history question to ask the set-up session (M2)."
+    )
+    parser.add_argument(
+        "--html-out", help="Optional path to write the produced Plotly figure as HTML."
+    )
     args = parser.parse_args(argv)
 
     enable_thinking = not args.no_thinking
+    if args.ask or args.org or args.well:
+        if not (args.org and args.well and args.ask):
+            parser.error("--ask mode requires all of --org, --well, and --ask.")
+        return _run_session_ask(
+            args.org,
+            args.well,
+            args.ask,
+            args.profile,
+            args.region,
+            enable_thinking,
+            html_out=args.html_out,
+        )
     if args.batch:
         return _run_batch(args.profile, args.region, enable_thinking)
     return _run_interactive(args.profile, args.region, enable_thinking)

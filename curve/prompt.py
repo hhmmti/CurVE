@@ -16,6 +16,9 @@ constant can be imported instead of snapshotted). Do not treat this copy as the
 source of truth.
 """
 
+from datetime import date
+from typing import Optional
+
 # --- verbatim snapshot of VIRTUAL_ENGINEER_SYSTEM_PROMPT (monorepo) -----------
 # Snapshot date: M1 build. Source: esp_resources_v2/llm/prompts.py
 _VE_SYSTEM_PROMPT_SNAPSHOT = """
@@ -85,9 +88,12 @@ Describe frequency changes as the coarse rate-control lever. Increasing frequenc
 Communicate confidently that in the 500–1,800 psi PIP range, back-pressure is primarily a stability and load-smoothing mechanism, while frequency primarily controls rate and drawdown. Recommend back-pressure to stabilize the pump and avoid gas-handling issues, and use frequency adjustments intentionally and infrequently to set the overall operating point.”
 """
 
-# --- thin CurVE addendum ------------------------------------------------------
-# Kept minimal on purpose — the base supplies the ESP expertise. This only frames
-# the one new mechanism: tools. (Trust-label / narration overrides arrive in M2.)
+# --- CurVE addendum -----------------------------------------------------------
+# Kept thin — the base supplies the ESP expertise. This frames the tool mechanism
+# and (M2) selectively OVERRIDES the base's "communicate without hedging" line with
+# the trust-basis instruction, and adds the narration guidance. Draft per
+# CurVE-decisions §2 D9 / §4 D6 (the honesty override, Keith-approved); the user
+# tunes the wording against live CLI output.
 _CURVE_ADDENDUM = """
 ---
 CurVE tool use:
@@ -95,14 +101,83 @@ You have a set of tools available. When a question needs well data or a physics
 calculation, call the matching tool rather than answering from memory or
 assumptions. Choose exactly the one tool whose description fits the question; if a
 question spans more than one capability, call each relevant tool. Do not guess at
-numbers a tool would provide. After the tool result returns, answer the operator's
-question using it.
+numbers a tool would provide. The selected well and its organization are already
+set up for this session and are injected into each tool call automatically — never
+ask the operator for them and never pass them as tool arguments. Supply only the
+per-question selectors a tool asks for (such as a time window).
+
+Trust basis (this SELECTIVELY OVERRIDES the base instruction to "communicate
+recommendations directly and without hedging"):
+Every tool result carries a `trust_label` — one of Validated, Estimated, Proxy, or
+Research prototype — and a `flags` list. When you answer, STATE the trust label and
+the reason it holds. For example: "These figures are Validated — they come straight
+from measured allocation and telemetry, with no proxy or default substituted." If
+`flags` name a proxied or defaulted input, say which input was substituted and how
+that limits confidence (e.g. "Estimated — well depth used a default"). Do NOT drop,
+soften, or inflate the label to sound more confident: the operator's trust depends
+on knowing the basis. Stating the trust basis is not hedging — it is the honesty the
+base prompt's confidence instruction yields to here. If a tool result is `blocked`
+or unavailable, say so plainly and why.
+
+Narration (single-tool answer shape, CurVE-decisions §3 D8):
+Answer with ONE synthesizing paragraph driven by the tool's `values`. Tell the story
+the numbers carry — the trend, the current state, what it means for the well — and
+state the trust basis. Do NOT restate every raw number: the UI renders the figure
+and the KPI cards, so your job is the synthesis and the trust basis, not a readout of
+the values.
 """
+
+# Setup context line (CurVE-decisions §2 D8 / §3 D3) — formatted per-session by the
+# engine and appended as a system block (the well + today + data range change per
+# session, so they cannot be baked into the static prompt above).
+#
+# DATE ANCHOR (added after the M2 demo): the model has no inherent notion of "today"
+# and was computing relative windows ("last 90 days") off a stale guess, landing the
+# window before the well's data and getting an empty fetch (gate → blocked) even
+# though the data exists. The base VE injects {today} into its queries; CurVE must
+# too. We give the model today's date AND the well's available data range so its
+# window math is anchored and stays in range.
+_SETUP_CONTEXT_TEMPLATE = (
+    "Setup complete for this session. Selected well: {well_id} "
+    "(organization {organization_id}). Today's date is {today}. {coverage}"
+    "The well and organization are already resolved and are injected into every "
+    "tool call automatically — do not ask the operator for them and do not pass "
+    "them as tool arguments. When the operator asks for a relative time window "
+    "(e.g. 'the last 90 days'), compute start_date/end_date from today's date above, "
+    "keep them within the available data range, and pass them in YYYY-MM-DD form. If "
+    "no window is implied, omit start_date/end_date to use the full history. Supply "
+    "only per-question selectors (such as the time window)."
+)
 
 
 def build_system_prompt() -> str:
     """Return the composed CurVE system prompt (snapshot base + addendum)."""
     return _VE_SYSTEM_PROMPT_SNAPSHOT.rstrip() + "\n" + _CURVE_ADDENDUM
+
+
+def format_setup_context(session: dict, today: Optional[str] = None) -> str:
+    """Format the per-session setup context line from a session record.
+
+    ``today`` defaults to the real wall-clock date (the production Lambda wants the
+    true current date; the demo machine clock is the live date). The well's available
+    data range is read from ``session['availability']['coverage']`` when the setup
+    step recorded it, so the model keeps relative windows inside the real data span.
+    """
+    today = today or date.today().isoformat()
+    coverage = ""
+    cov = (session.get("availability") or {}).get("coverage") or {}
+    if cov.get("min_day") and cov.get("max_day"):
+        coverage = (
+            f"This well has telemetry + production data available from "
+            f"{cov['min_day']} to {cov['max_day']} (do not request dates outside "
+            f"this range). "
+        )
+    return _SETUP_CONTEXT_TEMPLATE.format(
+        well_id=session.get("well_id"),
+        organization_id=session.get("organization_id"),
+        today=today,
+        coverage=coverage,
+    )
 
 
 CURVE_SYSTEM_PROMPT = build_system_prompt()
