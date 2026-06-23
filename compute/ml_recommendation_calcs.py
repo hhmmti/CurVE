@@ -478,8 +478,10 @@ def augment_with_delta_p_pump(
         Recommended intake pressure is assumed unchanged from current 1d average intake.
 
         Assumption/fallback behavior:
-                - If current intake is missing, fallback approximation is applied:
-                    intake ~= tubing_pressure / 0.45.
+                - PIP is measured-or-missing: if current intake is missing it is NOT
+                    proxied. The legacy tubing/0.45 fallback was removed after the
+                    PIP ~ tubing regression was rejected (weak; see pip_reg_report);
+                    missing intake is flagged a missing required input instead.
                 - If recommendation intake is missing, recommended intake is assumed
                     equal to current intake.
                 - sg_oil, sg_water, and well_depth_ft are caller-provided inputs and
@@ -494,12 +496,12 @@ def augment_with_delta_p_pump(
     cur_oil_alloc = _to_float(summary.get("alloc_oil_vol_1d_ago"))
     cur_water_alloc = _to_float(summary.get("alloc_water_vol_1d_ago"))
 
+    # PIP is measured-or-missing: the legacy tubing/0.45 intake proxy was removed
+    # after the PIP ~ tubing regression was rejected (weak; LOWO R² ~= -0.01,
+    # ~37% error — see pip_reg_report). Missing intake stays missing — never
+    # backfilled with a constant — so delta-P is NaN and the readiness fields below
+    # mark PIP a missing, operator-suppliable required input.
     intake_fallback_used = False
-    if _is_missing(cur_intake) and (not _is_missing(cur_tubing)):
-        # Intake-pressure fallback proxy (legacy approximation).
-        # Used only when direct intake sensor value is unavailable.
-        cur_intake = cur_tubing / 0.45
-        intake_fallback_used = True
 
     # Recommended-state values from model recommendation payload.
     rec_tubing = _to_float(out.get("rec_tubing_pressure_psi"))
@@ -589,7 +591,7 @@ def augment_with_delta_p_pump(
             "delta_p_missing_inputs": missing_inputs,
             "delta_p_ready": len(missing_inputs) == 0 and not np.isnan(delta_delta_p),
             "delta_p_intake_fallback_used": intake_fallback_used,
-            "delta_p_intake_source": "fallback_tubing_over_0.45" if intake_fallback_used else "json_summary_data.pump_intake_pressure_psi_1d_avg",
+            "delta_p_intake_source": "measured" if not _is_missing(cur_intake) else "missing",
             "delta_p_summary_extract": {
                 "pump_intake_pressure_psi_1d_avg": summary.get("pump_intake_pressure_psi_1d_avg"),
                 "tubing_pressure_psi_1d_avg": summary.get("tubing_pressure_psi_1d_avg"),
