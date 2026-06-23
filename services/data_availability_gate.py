@@ -307,9 +307,8 @@ def _contracts_registry() -> Dict[str, CalculationContract]:
                 RequiredField(
                     "pump_intake_pressure_psi",
                     treat_zero_as_missing=True,
-                    fallback_strategy="intake_from_tubing_over_0_45",
-                    fallback_fields=("tubing_pressure_psi",),
-                    notes="Service-layer intake fallback is approved for this path.",
+                    manual_resolvable=True,
+                    notes="PIP is measured-or-missing; tubing/0.45 intake proxy removed (regression rejected — see pip_reg_report). Operator-suppliable, not proxied.",
                 ),
             ),
         ),
@@ -326,8 +325,8 @@ def _contracts_registry() -> Dict[str, CalculationContract]:
                 RequiredField(
                     "cur_pump_intake_pressure_psi",
                     treat_zero_as_missing=True,
-                    fallback_strategy="intake_from_tubing_over_0_45",
-                    fallback_fields=("cur_tubing_pressure_psi",),
+                    manual_resolvable=True,
+                    notes="PIP is measured-or-missing; tubing/0.45 intake proxy removed (regression rejected — see pip_reg_report). Operator-suppliable, not proxied.",
                 ),
                 RequiredField(
                     "well_depth_ft",
@@ -744,7 +743,6 @@ def demo_gate_for_preprocessed_df(df: pd.DataFrame) -> Dict[str, Any]:
         "dataframes": {"preprocessed": df},
         "fallbacks_available": {
             "derive_liquid_rate_from_alloc",
-            "intake_from_tubing_over_0_45",
             "default_sg_values",
             "default_well_depth_ft",
             "default_sg_for_dp",

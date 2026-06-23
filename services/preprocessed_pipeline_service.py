@@ -149,18 +149,14 @@ def run_preprocessed_analysis_from_joined(
         "production_max_date": np.nan,
     }
 
-    # Check if pump intake fallback is needed
-    needs_fallback = preprocessed_calcs.check_pump_intake_fallback_needed(merged)
-
-    # Apply fallback if needed: approximate intake from tubing pressure.
-    # This is an estimate path, not a validated intake measurement.
-    if needs_fallback:
-        tubing = pd.to_numeric(merged.get("tubing_pressure_psi", np.nan), errors="coerce")
-        merged["pump_intake_pressure_psi"] = np.where(
-            (merged["pump_intake_pressure_psi"].isna()) | (merged["pump_intake_pressure_psi"] == 0),
-            tubing / 0.45,  # Legacy intake proxy approximation.
-            merged["pump_intake_pressure_psi"],
-        )
+    # PIP is measured-or-missing: the legacy tubing/0.45 intake proxy was removed
+    # after the PIP ~ tubing regression was rejected (weak; LOWO R² ~= -0.01,
+    # ~37% error — see pip_reg_report). Null/zero intake is marked missing (NaN),
+    # never backfilled with a constant; engineer_features() then yields NaN delta-P,
+    # which the readiness layer surfaces as a missing, operator-suppliable input.
+    if "pump_intake_pressure_psi" in merged.columns:
+        intake = pd.to_numeric(merged["pump_intake_pressure_psi"], errors="coerce")
+        merged["pump_intake_pressure_psi"] = intake.where(intake > 0, np.nan)
 
     # Stage 4: Feature engineering
     analyzed = preprocessed_calcs.engineer_features(
@@ -178,7 +174,7 @@ def run_preprocessed_analysis_from_joined(
 
     metadata = {
         **join_meta,
-        "pump_intake_fallback_applied": needs_fallback,
+        "pump_intake_fallback_applied": False,  # PIP intake proxy removed (regression rejected); measured-or-missing.
         "quality_profile": quality_profile,
     }
 
