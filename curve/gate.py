@@ -37,6 +37,8 @@ _TRUST_PRECEDENCE: List[str] = ["Validated", "Estimated", "Proxy", "Research pro
 # (V1 Allocation Temporal) is driven by the allocation calcs, all Validated.
 _TOOL_GATE_KEYS: Dict[str, List[str]] = {
     "production_history": ["liquid_rate", "gor", "water_cut"],
+    # water_cut_gor_history is driven by the same Validated fluid-character calcs.
+    "water_cut_gor_history": ["liquid_rate", "gor", "water_cut"],
 }
 
 # Fallbacks the gate is allowed to use for these keys. ``derive_liquid_rate_from_alloc``
@@ -44,7 +46,47 @@ _TOOL_GATE_KEYS: Dict[str, List[str]] = {
 # derivation, not a trust downgrade (the contract stays Validated).
 _TOOL_GATE_FALLBACKS: Dict[str, set] = {
     "production_history": {"derive_liquid_rate_from_alloc"},
+    "water_cut_gor_history": {"derive_liquid_rate_from_alloc"},
 }
+
+# --- field-name alias layer (§5 naming debt) ----------------------------------
+# A small GENERAL mechanism: legacy field-name variants → canonical, applied to the
+# frames before the gate reads them, so a contract that asks for the canonical name
+# resolves even when a pipeline path delivered the legacy spelling.
+#
+# Canonical is **lower-snake**. The vendored gate reads fields by exact column name
+# (``data_availability_gate._collect_candidate_sources``); rather than touch that
+# vendored seam, we normalize the frames here — when a frame has the legacy column
+# but not the canonical one, we surface the canonical name from the legacy values.
+#
+# EXTEND BY ADDING A PAIR — nothing here is GOR-specific. Prompt #4 maps the
+# ``delta_p_*`` debt by adding e.g. ``"delta_P_pump_psi": "delta_p_pump_psi"`` to
+# this dict; no mechanism change is needed.
+_FIELD_ALIASES: Dict[str, str] = {
+    "GOR_scf_bbl": "gor_scf_bbl",  # §5 naming debt: legacy upper variant → canonical
+}
+
+
+def _apply_field_aliases(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Surface canonical field names from legacy variants on a copy of ``df``.
+
+    For each ``legacy → canonical`` pair, when the frame carries the legacy column
+    but not the canonical one, add the canonical column from the legacy values. The
+    legacy column is left in place (non-destructive). Returns ``df`` unchanged when
+    there is nothing to alias (no copy made on the hot path)."""
+    if df is None or len(df) == 0:
+        return df
+    to_add = {
+        canonical: legacy
+        for legacy, canonical in _FIELD_ALIASES.items()
+        if legacy in df.columns and canonical not in df.columns
+    }
+    if not to_add:
+        return df
+    df = df.copy()
+    for canonical, legacy in to_add.items():
+        df[canonical] = df[legacy]
+    return df
 
 
 def _is_empty(df: Optional[pd.DataFrame]) -> bool:
@@ -78,6 +120,10 @@ def run_tool_gate(
             "trust_label": None,
             "flags": ["telemetry_or_production_absent"],
         }
+
+    # Normalize legacy field-name variants → canonical before the gate reads fields.
+    telemetry_df = _apply_field_aliases(telemetry_df)
+    production_df = _apply_field_aliases(production_df)
 
     context = {
         "dataframes": {"telemetry": telemetry_df, "production": production_df},

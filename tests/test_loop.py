@@ -118,9 +118,9 @@ def test_usage_summed_across_multi_call_turn():
 
 def test_tool_result_appended_between_turns():
     wrapper = ScriptedWrapper(
-        [_tool_use_turn("bubble_point_screen"), _end_turn()]
+        [_tool_use_turn("curve_position"), _end_turn()]
     )
-    run_curve_turn("Is W-12 below bubble point?", wrapper=wrapper)
+    run_curve_turn("Where is W-12 on its curve?", wrapper=wrapper)
 
     # The messages seen on the 2nd converse call: user q, assistant tool_use,
     # user toolResult.
@@ -131,7 +131,7 @@ def test_tool_result_appended_between_turns():
     assert tool_result_msg["role"] == "user"
     block = tool_result_msg["content"][0]["toolResult"]
     assert block["toolUseId"] == "tu-1"
-    assert block["content"][0]["json"]["mock"] == "bubble_point_screen output"
+    assert block["content"][0]["json"]["mock"] == "curve_position output"
 
 
 def test_reasoning_content_preserved_verbatim():
@@ -218,8 +218,12 @@ def test_wrapper_inference_config_without_thinking():
 
 
 def test_real_registry_specs_are_converse_shaped():
-    """The 3 stub tools carry real, Converse-shaped toolSpecs."""
-    assert set(TOOL_REGISTRY) == {"production_history", "curve_position", "bubble_point_screen"}
+    """Every registered tool carries a real, Converse-shaped toolSpec."""
+    assert set(TOOL_REGISTRY) == {
+        "production_history",
+        "water_cut_gor_history",
+        "curve_position",
+    }
     for name, entry in TOOL_REGISTRY.items():
         spec = entry["spec"]["toolSpec"]
         assert spec["name"] == name

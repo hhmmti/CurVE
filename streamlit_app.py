@@ -127,6 +127,8 @@ def _availability_probe(organization_id: str, well_id: str) -> Dict[str, Any]:
     )
     return {
         "gate": run_tool_gate("production_history", telemetry_df, production_df),
+        # Second connection-free Validated tool — same data, same gate keys.
+        "gate_wcg": run_tool_gate("water_cut_gor_history", telemetry_df, production_df),
         "coverage": _coverage(telemetry_df, production_df),
     }
 
@@ -168,24 +170,72 @@ def _render_kpis(values: Dict[str, Any]) -> None:
         )
 
 
-def _render_answer(entry: Dict[str, Any], dev_mode: bool) -> None:
-    """Render one assistant turn: badge + KPI + figure + narration (+ dev panel)."""
-    envelope = entry.get("primary_envelope")
+def _render_wcg_kpis(values: Dict[str, Any]) -> None:
+    """KPI cards for water_cut_gor_history (water cut + GOR + liquid rate)."""
+    latest = (values or {}).get("latest") or {}
+    trend = (values or {}).get("trend") or {}
+    period = (values or {}).get("period") or {}
 
-    if envelope is not None:
-        trust = envelope.get("trust_label")
-        status = envelope.get("status")
-        if status == "available":
-            st.markdown(_trust_badge(trust), unsafe_allow_html=True)
-            _render_kpis(envelope.get("values"))
-            figure = envelope.get("figure")
-            if figure is not None:
-                st.plotly_chart(figure, use_container_width=True)
-        else:
-            st.warning(
-                f"`production_history` is **{status}** — "
-                f"{', '.join(envelope.get('flags') or []) or 'no detail'}."
-            )
+    c1, c2, c3, c4 = st.columns(4)
+    wc = latest.get("water_cut")
+    wc_change = trend.get("water_cut_change_pct")
+    c1.metric(
+        "Water cut (latest)",
+        f"{wc*100:.1f}%" if wc is not None else "—",
+        delta=f"{wc_change:+.1f}% over window" if wc_change is not None else None,
+    )
+    gor = latest.get("gor")
+    gor_change = trend.get("gor_change_pct")
+    c2.metric(
+        "GOR (latest)",
+        f"{gor:.0f} scf/bbl" if gor is not None else "—",
+        delta=f"{gor_change:+.1f}% over window" if gor_change is not None else None,
+    )
+    liquid = latest.get("liquid_rate_bbl_day")
+    c3.metric("Liquid rate (latest)", f"{liquid:.0f} bbl/d" if liquid is not None else "—")
+    c4.metric("Trend", (trend.get("direction") or "—").replace("_", " "))
+
+    if period:
+        st.caption(
+            f"Window: {period.get('start')} → {period.get('end')} "
+            f"· {period.get('n_days')} days · "
+            f"{period.get('n_telemetry_points')} telemetry points"
+        )
+
+
+# Physics tools whose envelopes render as figure + KPI block; name → KPI renderer.
+_TOOL_KPI_RENDERERS = {
+    "production_history": _render_kpis,
+    "water_cut_gor_history": _render_wcg_kpis,
+}
+
+
+def _render_tool_envelope(name: str, envelope: Dict[str, Any]) -> None:
+    """Render one tool envelope: badge + tool-specific KPI + figure (or a status warning)."""
+    status = envelope.get("status")
+    if status == "available":
+        st.markdown(_trust_badge(envelope.get("trust_label")), unsafe_allow_html=True)
+        kpi_renderer = _TOOL_KPI_RENDERERS.get(name)
+        if kpi_renderer is not None:
+            kpi_renderer(envelope.get("values"))
+        figure = envelope.get("figure")
+        if figure is not None:
+            st.plotly_chart(figure, use_container_width=True)
+    else:
+        st.warning(
+            f"`{name}` is **{status}** — "
+            f"{', '.join(envelope.get('flags') or []) or 'no detail'}."
+        )
+
+
+def _render_answer(entry: Dict[str, Any], dev_mode: bool) -> None:
+    """Render one assistant turn: per-tool badge + KPI + figure + narration (+ dev panel)."""
+    # Render each physics tool the loop called (usually one — single-tool answer shape).
+    for output in entry.get("tool_outputs") or []:
+        name = output.get("name")
+        envelope = output.get("result")
+        if name in _TOOL_KPI_RENDERERS and isinstance(envelope, dict):
+            _render_tool_envelope(name, envelope)
 
     # The one synthesizing narration paragraph (answer-level).
     st.markdown(entry.get("narration") or "_(no narration)_")
@@ -234,7 +284,10 @@ def render_page() -> None:
     _bind_session_store()
 
     st.title("🛢️ CurVE — Virtual Engineer physics validation")
-    st.caption("M2 demo · production history, real telemetry + production, live trust label")
+    st.caption(
+        "M3 demo · production history + water-cut/GOR history, real telemetry + "
+        "production, live trust label"
+    )
 
     # --- sidebar: setup step (well select → availability) ---------------------
     with st.sidebar:
@@ -276,6 +329,7 @@ def render_page() -> None:
                         well_id=well_id,
                         availability={
                             "production_history": probe["gate"],
+                            "water_cut_gor_history": probe["gate_wcg"],
                             "coverage": probe["coverage"],
                         },
                     )
@@ -291,17 +345,22 @@ def render_page() -> None:
         st.info("Select a well in the sidebar and run setup to begin.")
         return
 
-    gate = (record.get("availability") or {}).get("production_history", {})
-    coverage = (record.get("availability") or {}).get("coverage") or {}
+    availability = record.get("availability") or {}
+    gate = availability.get("production_history", {})
+    coverage = availability.get("coverage") or {}
     available = gate.get("status") == "available"
     with st.container():
         st.subheader(f"Well {record['well_id']} — availability")
-        cols = st.columns([1, 3])
-        cols[0].markdown(_trust_badge(gate.get("trust_label")), unsafe_allow_html=True)
-        cols[1].markdown(
-            f"**production_history** → `{gate.get('status')}`"
-            + (f" · flags: {gate.get('flags')}" if gate.get("flags") else "")
-        )
+        for tool_name in ("production_history", "water_cut_gor_history"):
+            tool_gate = availability.get(tool_name, {})
+            cols = st.columns([1, 3])
+            cols[0].markdown(
+                _trust_badge(tool_gate.get("trust_label")), unsafe_allow_html=True
+            )
+            cols[1].markdown(
+                f"**{tool_name}** → `{tool_gate.get('status')}`"
+                + (f" · flags: {tool_gate.get('flags')}" if tool_gate.get("flags") else "")
+            )
         if coverage.get("min_day") and coverage.get("max_day"):
             st.caption(
                 f"Data available: {coverage['min_day']} → {coverage['max_day']}"
@@ -309,7 +368,7 @@ def render_page() -> None:
     if not available:
         st.warning(
             "Telemetry + production not both present for this well — "
-            "`production_history` is unavailable. Pick another well."
+            "the connection-free tools are unavailable. Pick another well."
         )
         return
 
@@ -322,7 +381,7 @@ def render_page() -> None:
             else:
                 _render_answer(entry, dev_mode)
 
-    question = st.chat_input("Ask about this well's production history…")
+    question = st.chat_input("Ask about this well's production, water cut, or GOR history…")
     if question:
         st.session_state["chat"].append({"role": "user", "text": question})
         with st.chat_message("user"):
@@ -334,16 +393,10 @@ def render_page() -> None:
                     question, session=record, profile_name=profile
                 )
                 elapsed = time.time() - started
-            # Pull the production_history envelope (single-tool shape) for rendering.
-            primary = None
-            for output in result.get("tool_outputs", []):
-                if output.get("name") == "production_history":
-                    primary = output.get("result")
-                    break
+            # Rendering is driven by tool_outputs — each physics tool the loop called.
             entry = {
                 "role": "assistant",
                 "narration": result.get("text"),
-                "primary_envelope": primary,
                 "tool_trace": result.get("tool_trace"),
                 "tool_outputs": result.get("tool_outputs"),
                 "stop_reason": result.get("stop_reason"),
