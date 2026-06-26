@@ -9,8 +9,15 @@ a session record and the model narrating the trust basis. (Streamlit surface = 2
 """
 
 from .data import PreprocessedDataAccess, fetch_preprocessed_window
+from .delta_p_inputs import (
+    CURVE_DEFAULT_DEPTH_FT,
+    DeltaPInputs,
+    pip_coverage,
+    resolve_delta_p_inputs,
+    resolve_from_context,
+)
 from .engine import MAX_ITERATIONS, run_curve_turn
-from .gate import run_tool_gate
+from .gate import run_delta_p_tool_gate, run_tool_gate
 from .prompt import CURVE_SYSTEM_PROMPT, format_setup_context
 from .session import (
     clear_sessions,
@@ -20,6 +27,7 @@ from .session import (
     use_store,
 )
 from .tools import NON_MODEL_RESULT_KEYS, TOOL_REGISTRY, build_tool_config
+from .well_depth import fetch_well_depth_ft
 from .wrapper import CurveBedrockWrapper
 
 __all__ = [
@@ -34,6 +42,13 @@ __all__ = [
     "PreprocessedDataAccess",
     "fetch_preprocessed_window",
     "run_tool_gate",
+    "run_delta_p_tool_gate",
+    "resolve_delta_p_inputs",
+    "resolve_from_context",
+    "pip_coverage",
+    "DeltaPInputs",
+    "CURVE_DEFAULT_DEPTH_FT",
+    "fetch_well_depth_ft",
     "new_session_record",
     "save_session",
     "load_session",

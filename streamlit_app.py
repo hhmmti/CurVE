@@ -34,10 +34,14 @@ from typing import Any, Dict, List, Optional
 import streamlit as st
 
 from cli import _estimate_cost_usd  # reuse the M1 cost estimator (no logic copied)
-from curve import data, session
+from curve import data, delta_p_inputs, session, well_depth
 from curve.engine import run_curve_turn
 from curve.gate import run_tool_gate
-from curve.tools import NON_MODEL_RESULT_KEYS
+from curve.tools import NON_MODEL_RESULT_KEYS, probe_delta_p_readiness
+
+# The ΔP history tools front-loaded at setup (Estimated-label tools) + the Validated
+# connection-free tools. Order drives the availability report rows.
+_DELTA_P_TOOLS = ("delta_p_frequency", "delta_p_composition")
 
 DEFAULT_PROFILE = os.environ.get("CURVE_AWS_PROFILE", "roam-ai")
 
@@ -125,11 +129,24 @@ def _availability_probe(organization_id: str, well_id: str) -> Dict[str, Any]:
     telemetry_df, production_df = data.fetch_preprocessed_window(
         organization_id, well_id
     )
+    # Real rrc depth read (the ported app query) — drives the depth-override pre-fill
+    # and lets the report state which depth tier fired for this well.
+    rrc_depth_ft = well_depth.fetch_well_depth_ft(well_id)
+    # Front-load the ΔP tools' gate at the no-override baseline (rrc → default depth,
+    # default SG), so the readiness surface shows the Estimated label + PIP coverage.
+    delta_p_gates = {
+        tool: probe_delta_p_readiness(
+            tool, telemetry_df, production_df, well_id, resolved_inputs_ctx={}, rrc_depth_ft=rrc_depth_ft
+        )
+        for tool in _DELTA_P_TOOLS
+    }
     return {
         "gate": run_tool_gate("production_history", telemetry_df, production_df),
         # Second connection-free Validated tool — same data, same gate keys.
         "gate_wcg": run_tool_gate("water_cut_gor_history", telemetry_df, production_df),
         "coverage": _coverage(telemetry_df, production_df),
+        "rrc_depth_ft": rrc_depth_ft,
+        "delta_p": delta_p_gates,
     }
 
 
@@ -203,10 +220,53 @@ def _render_wcg_kpis(values: Dict[str, Any]) -> None:
         )
 
 
+def _render_dp_kpis(values: Dict[str, Any]) -> None:
+    """KPI cards for the ΔP history tools — ΔP, intake, the depth used + its source,
+    and PIP coverage (so the Estimated basis is visible alongside the numbers)."""
+    latest = (values or {}).get("latest") or {}
+    trend = (values or {}).get("trend") or {}
+    period = (values or {}).get("period") or {}
+    inputs = (values or {}).get("inputs") or {}
+
+    c1, c2, c3, c4 = st.columns(4)
+    dp = latest.get("delta_p_pump_psi")
+    dp_change = trend.get("delta_p_pump_change_pct")
+    c1.metric(
+        "ΔP pump (latest)",
+        f"{dp:.0f} psi" if dp is not None else "—",
+        delta=f"{dp_change:+.1f}% over window" if dp_change is not None else None,
+    )
+    pip = latest.get("pump_intake_pressure_psi")
+    c2.metric("Pump intake (latest)", f"{pip:.0f} psi" if pip is not None else "—")
+    depth = inputs.get("depth_ft")
+    c3.metric(
+        "Depth used",
+        f"{depth:,.0f} ft" if depth is not None else "—",
+        help=f"source: {inputs.get('depth_source')} · SG source: {inputs.get('sg_source')}",
+    )
+    cov = period.get("pip_coverage") or {}
+    c4.metric(
+        "PIP coverage",
+        f"{cov.get('rows_with_pip', 0)}/{cov.get('rows_total', 0)} rows",
+    )
+
+    if period:
+        st.caption(
+            f"Window: {period.get('start')} → {period.get('end')} "
+            f"· {period.get('n_days')} days · "
+            f"{period.get('n_telemetry_points')} PIP-present points · "
+            f"depth {depth:,.0f} ft ({inputs.get('depth_source')})"
+            if depth is not None
+            else f"Window: {period.get('start')} → {period.get('end')}"
+        )
+
+
 # Physics tools whose envelopes render as figure + KPI block; name → KPI renderer.
 _TOOL_KPI_RENDERERS = {
     "production_history": _render_kpis,
     "water_cut_gor_history": _render_wcg_kpis,
+    "delta_p_frequency": _render_dp_kpis,
+    "delta_p_composition": _render_dp_kpis,
 }
 
 
@@ -276,6 +336,86 @@ def _render_dev_panel(entry: Dict[str, Any]) -> None:
             st.json(model_facing)
 
 
+def _render_delta_p_input_overrides(
+    record: Dict[str, Any], availability: Dict[str, Any]
+) -> None:
+    """Editable, pre-filled depth + SG fields that feed the ΔP tools (in scope, #5).
+
+    The fields are pre-filled with EXACTLY what the tool would resolve without an
+    override — the real rrc depth when present, else the CurVE 10,000 ft default, and
+    the default SG endpoints. The operator accepts or overrides; a changed value is
+    stored as an override on the session's ``resolved_inputs`` (which the engine injects
+    into every ΔP tool call), changes the computed ΔP, and keeps the label Estimated.
+    Accepting the pre-fill stores no override — the default/real value is used and
+    surfaced here, never silently assumed. PIP is never shown as editable — it is
+    measured-or-missing, not defaultable.
+    """
+    rrc_depth = availability.get("rrc_depth_ft")
+    prefill = delta_p_inputs.default_prefill()
+    # Pre-fill depth with the real rrc value when present, else the CurVE default.
+    prefill_depth = float(rrc_depth) if rrc_depth else float(prefill["depth_ft"])
+    depth_tier = "real rrc depth" if rrc_depth else f"CurVE default {prefill['depth_ft']:,.0f} ft"
+
+    with st.expander("⚙️ ΔP physics inputs — depth & SG (editable, pre-filled)", expanded=False):
+        st.caption(
+            f"Pre-filled with the value the ΔP tools would use with no override "
+            f"(**{depth_tier}**). Edit to override — a hand-typed value is honored, "
+            f"keeps the trust label **Estimated**, and is reflected in the source flags. "
+            f"PIP is measured-only and never defaulted."
+        )
+        c1, c2, c3 = st.columns(3)
+        depth_val = c1.number_input(
+            "Well depth (TVD, ft)",
+            min_value=0.0,
+            value=prefill_depth,
+            step=100.0,
+            key=f"dp_depth_{record['well_id']}",
+        )
+        sg_oil_val = c2.number_input(
+            "SG oil",
+            min_value=0.0,
+            max_value=2.0,
+            value=float(prefill["sg_oil"]),
+            step=0.01,
+            key=f"dp_sgoil_{record['well_id']}",
+        )
+        sg_water_val = c3.number_input(
+            "SG water",
+            min_value=0.0,
+            max_value=2.0,
+            value=float(prefill["sg_water"]),
+            step=0.01,
+            key=f"dp_sgwater_{record['well_id']}",
+        )
+
+        # Only a CHANGE from the pre-fill is an override; otherwise let the tool resolve
+        # real-rrc → default (so accepting a real rrc depth stays Validated-eligible for
+        # that input, and accepting the default stays a surfaced default).
+        overrides: Dict[str, Any] = {}
+        if abs(depth_val - prefill_depth) > 1e-9:
+            overrides["depth_override"] = depth_val
+        if abs(sg_oil_val - float(prefill["sg_oil"])) > 1e-9:
+            overrides["sg_oil_override"] = sg_oil_val
+        if abs(sg_water_val - float(prefill["sg_water"])) > 1e-9:
+            overrides["sg_water_override"] = sg_water_val
+
+        # Persist onto the session so the engine injects it into each ΔP tool call.
+        record["resolved_inputs"] = overrides
+        session.save_session(record)
+
+        # Show the provenance the next ΔP answer will carry.
+        resolved = delta_p_inputs.resolve_from_context(
+            overrides, float(rrc_depth) if rrc_depth else None
+        )
+        st.markdown(
+            _trust_badge(resolved.trust_label)
+            + f"  &nbsp; depth **{resolved.depth_ft:,.0f} ft** "
+            f"(`{resolved.depth_source}`) · SG {resolved.sg_oil}/{resolved.sg_water} "
+            f"(`{resolved.sg_source}`) · flags: `{resolved.flags}`",
+            unsafe_allow_html=True,
+        )
+
+
 # --- page ---------------------------------------------------------------------
 
 
@@ -327,10 +467,24 @@ def render_page() -> None:
                         session_id=session_id,
                         organization_id=organization_id,
                         well_id=well_id,
+                        # resolved_inputs starts empty → the ΔP tools resolve depth/SG
+                        # by real-rrc → default. The operator's edits below populate the
+                        # override keys, which the engine injects into each tool call.
+                        resolved_inputs={},
                         availability={
                             "production_history": probe["gate"],
                             "water_cut_gor_history": probe["gate_wcg"],
                             "coverage": probe["coverage"],
+                            "rrc_depth_ft": probe.get("rrc_depth_ft"),
+                            "delta_p_frequency": probe["delta_p"]["delta_p_frequency"]["gate"],
+                            "delta_p_composition": probe["delta_p"]["delta_p_composition"]["gate"],
+                            "delta_p_meta": {
+                                t: {
+                                    "coverage": probe["delta_p"][t]["coverage"],
+                                    "resolved": probe["delta_p"][t]["resolved"],
+                                }
+                                for t in _DELTA_P_TOOLS
+                            },
                         },
                     )
                 )
@@ -351,7 +505,11 @@ def render_page() -> None:
     available = gate.get("status") == "available"
     with st.container():
         st.subheader(f"Well {record['well_id']} — availability")
-        for tool_name in ("production_history", "water_cut_gor_history"):
+        for tool_name in (
+            "production_history",
+            "water_cut_gor_history",
+            *_DELTA_P_TOOLS,
+        ):
             tool_gate = availability.get(tool_name, {})
             cols = st.columns([1, 3])
             cols[0].markdown(
@@ -365,6 +523,9 @@ def render_page() -> None:
             st.caption(
                 f"Data available: {coverage['min_day']} → {coverage['max_day']}"
             )
+
+    # --- editable ΔP physics inputs (depth + SG overrides) --------------------
+    _render_delta_p_input_overrides(record, availability)
     if not available:
         st.warning(
             "Telemetry + production not both present for this well — "

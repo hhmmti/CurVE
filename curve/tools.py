@@ -35,13 +35,15 @@ import pandas as pd
 from compute.preprocessed_calcs import WELL_DEPTH_FT
 from plotting.preprocessed_charts import (
     build_allocation_temporal,
+    build_delta_p_composition,
+    build_delta_p_pump_vs_frequency,
     build_water_cut_gor_analysis,
 )
 
-from . import data
+from . import data, delta_p_inputs, well_depth
 from ._vendored import preprocessed_pipeline_service
 from .envelope import error_envelope, success_envelope
-from .gate import run_tool_gate
+from .gate import run_delta_p_tool_gate, run_tool_gate
 
 # Vendored pipeline fns (loaded by path to skip the broken services/__init__.py).
 prepare_daily_data = preprocessed_pipeline_service.prepare_daily_data
@@ -294,6 +296,285 @@ def water_cut_gor_history(tool_input: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+# --- real tools: delta_p_frequency + delta_p_composition (ΔP history) ----------
+# Both sit on the SAME vendored delta_p_pump preprocessed compute and differ only in
+# projection / x-axis / figure. They are the FIRST CurVE tools to carry the Estimated
+# trust label end-to-end (depth + SG resolved by curve.delta_p_inputs) and the first to
+# resolve a real depth (curve.well_depth rrc read) with an operator override. PIP is
+# measured-or-missing — ΔP is computed on PIP-present rows; PIP-absent rows are excluded
+# with a coverage flag; zero PIP coverage hard-blocks. Org/well/overrides are
+# backend-injected (not model args); the Converse spec exposes only the time window.
+
+
+def _dp_period(daily: pd.DataFrame, coverage: Dict[str, Any]) -> Dict[str, Any]:
+    """Period coverage block shared by both ΔP tools, including PIP coverage."""
+    n_days = len(daily)
+    return {
+        "start": str(daily["observation_day"].min().date()) if n_days else None,
+        "end": str(daily["observation_day"].max().date()) if n_days else None,
+        "n_days": int(n_days),
+        "n_telemetry_points": int(coverage.get("n_present", 0)),
+        "pip_coverage": {
+            "rows_with_pip": int(coverage.get("n_present", 0)),
+            "rows_total": int(coverage.get("n_total", 0)),
+            "fraction": coverage.get("fraction", 0.0),
+        },
+    }
+
+
+def _trend_of(daily: pd.DataFrame, field_name: str, ndigits: int = 1):
+    """First/last/percent-change of a daily field (None-safe)."""
+    if not len(daily):
+        return None, None, None
+    first = _round(daily.iloc[0].get(field_name), ndigits)
+    last = _round(daily.iloc[-1].get(field_name), ndigits)
+    change_pct = None
+    if first not in (None, 0) and last is not None:
+        change_pct = round((last - first) / first * 100.0, 1)
+    return first, last, change_pct
+
+
+def _project_dp_frequency_values(
+    well_id: str,
+    daily: pd.DataFrame,
+    resolved: "delta_p_inputs.DeltaPInputs",
+    coverage: Dict[str, Any],
+) -> Dict[str, Any]:
+    """ΔP-vs-frequency narration payload: ΔP_pump + motor frequency, trend, provenance."""
+    daily = daily.copy()
+    daily["observation_day"] = pd.to_datetime(daily["observation_day"], errors="coerce")
+    daily = daily.dropna(subset=["observation_day"]).sort_values("observation_day")
+
+    latest: Dict[str, Any] = {}
+    trend: Dict[str, Any] = {}
+    if len(daily):
+        last = daily.iloc[-1]
+        latest = {
+            "observation_day": str(last["observation_day"].date()),
+            "delta_p_pump_psi": _round(last.get("delta_p_pump_psi")),
+            "motor_frequency_hz": _round(last.get("motor_frequency_hz")),
+            "pump_intake_pressure_psi": _round(last.get("pump_intake_pressure_psi")),
+            "p_dis_downhole_psi": _round(last.get("p_dis_downhole_psi")),
+        }
+        dp_first, dp_last, dp_change = _trend_of(daily, "delta_p_pump_psi")
+        hz_first, hz_last, hz_change = _trend_of(daily, "motor_frequency_hz")
+        direction = "flat"
+        if dp_change is not None:
+            direction = "rising" if dp_change >= 5 else "declining" if dp_change <= -5 else "flat"
+        trend = {
+            "delta_p_pump_first_psi": dp_first,
+            "delta_p_pump_last_psi": dp_last,
+            "delta_p_pump_change_pct": dp_change,
+            "motor_frequency_first_hz": hz_first,
+            "motor_frequency_last_hz": hz_last,
+            "motor_frequency_change_pct": hz_change,
+            "direction": direction,
+        }
+
+    return {
+        "well_id": well_id,
+        "period": _dp_period(daily, coverage),
+        "latest": latest,
+        "trend": trend,
+        "inputs": resolved.as_values(),
+    }
+
+
+def _project_dp_composition_values(
+    well_id: str,
+    daily: pd.DataFrame,
+    resolved: "delta_p_inputs.DeltaPInputs",
+    coverage: Dict[str, Any],
+) -> Dict[str, Any]:
+    """ΔP-composition narration payload: the pressure-component decomposition + trend."""
+    daily = daily.copy()
+    daily["observation_day"] = pd.to_datetime(daily["observation_day"], errors="coerce")
+    daily = daily.dropna(subset=["observation_day"]).sort_values("observation_day")
+
+    latest: Dict[str, Any] = {}
+    trend: Dict[str, Any] = {}
+    if len(daily):
+        last = daily.iloc[-1]
+        latest = {
+            "observation_day": str(last["observation_day"].date()),
+            "pump_intake_pressure_psi": _round(last.get("pump_intake_pressure_psi")),
+            "delta_p_hyd_psi": _round(last.get("delta_p_hyd_psi")),
+            "tubing_pressure_psi": _round(last.get("tubing_pressure_psi")),
+            "p_dis_downhole_psi": _round(last.get("p_dis_downhole_psi")),
+            "delta_p_pump_psi": _round(last.get("delta_p_pump_psi")),
+        }
+        dp_first, dp_last, dp_change = _trend_of(daily, "delta_p_pump_psi")
+        hyd_first, hyd_last, hyd_change = _trend_of(daily, "delta_p_hyd_psi")
+        direction = "flat"
+        if dp_change is not None:
+            direction = "rising" if dp_change >= 5 else "declining" if dp_change <= -5 else "flat"
+        trend = {
+            "delta_p_pump_first_psi": dp_first,
+            "delta_p_pump_last_psi": dp_last,
+            "delta_p_pump_change_pct": dp_change,
+            "delta_p_hyd_first_psi": hyd_first,
+            "delta_p_hyd_last_psi": hyd_last,
+            "delta_p_hyd_change_pct": hyd_change,
+            "direction": direction,
+        }
+
+    return {
+        "well_id": well_id,
+        "period": _dp_period(daily, coverage),
+        "latest": latest,
+        "trend": trend,
+        "inputs": resolved.as_values(),
+    }
+
+
+def _run_delta_p_tool(
+    tool_input: Dict[str, Any],
+    *,
+    tool_name: str,
+    figure_builder: Callable[..., Any],
+    value_projector: Callable[..., Dict[str, Any]],
+    title: str,
+) -> Dict[str, Any]:
+    """Shared body for both ΔP history tools: fetch → resolve inputs → compute → gate
+    (PIP coverage + projection presence) → figure → envelope.
+
+    The two tools differ only in ``figure_builder`` (the vendored ΔP plot), the
+    ``value_projector`` (the per-tool ``values`` projection / x-axis) and ``title``.
+    Org/well + the resolved-input overrides arrive backend-injected in ``tool_input``.
+    """
+    organization_id = tool_input.get("organization_id")
+    well_id = tool_input.get("well_id")
+    start_date = tool_input.get("start_date")
+    end_date = tool_input.get("end_date")
+    # Operator-controlled depth/SG overrides — setup-injected like org/well, never a
+    # model-facing tool arg (the spec exposes only the time window).
+    resolved_inputs_ctx = tool_input.get("resolved_inputs")
+
+    if not organization_id or not well_id:
+        return error_envelope("blocked", ["missing_org_or_well_injection"])
+
+    try:
+        # Re-fetch this tool's own preprocessed frame via the SAME data path.
+        telemetry_df, production_df = data.fetch_preprocessed_window(
+            organization_id, well_id, start_date, end_date
+        )
+        # Presence gate BEFORE compute — don't compute on absent data.
+        if telemetry_df is None or len(telemetry_df) == 0 or production_df is None or len(production_df) == 0:
+            return error_envelope("blocked", ["telemetry_or_production_absent"], well_id=well_id)
+
+        # Resolve depth (real rrc → override → default) + SG (override → default). The
+        # real rrc depth read is the ported app query (curve.well_depth).
+        rrc_depth_ft = well_depth.fetch_well_depth_ft(well_id)
+        resolved = delta_p_inputs.resolve_from_context(resolved_inputs_ctx, rrc_depth_ft)
+
+        # Vendored ΔP_pump preprocessed compute, with the resolved depth/SG. PIP is
+        # measured-or-missing inside the service (null/zero intake → NaN ΔP).
+        analyzed, _meta = run_preprocessed_analysis(
+            telemetry_df,
+            production_df,
+            well_depth_ft=resolved.depth_ft,
+            sg_oil=resolved.sg_oil,
+            sg_water=resolved.sg_water,
+        )
+
+        # PIP coverage — READ from the computed frame (the #2 intake-state truth).
+        coverage = delta_p_inputs.pip_coverage(analyzed)
+
+        # Gate: zero-coverage / missing-projection → blocked; else Estimated + flags.
+        gate = run_delta_p_tool_gate(tool_name, analyzed, resolved, coverage)
+        if gate["status"] != "available":
+            return error_envelope(gate["status"], gate["flags"], well_id=well_id)
+
+        # Compute ΔP only on PIP-present rows; the vendored figure builds from them.
+        present = delta_p_inputs.pip_present_rows(analyzed, coverage)
+        figure = figure_builder(present, title=f"{title} — {well_id}")
+        daily = prepare_daily_data(present)
+        values = value_projector(well_id, daily, resolved, coverage)
+    except Exception as exc:  # data/compute failure → structured envelope, not an exception
+        return error_envelope("error", [f"data_or_compute_error: {exc}"], well_id=well_id)
+
+    return success_envelope(
+        values=values,
+        trust_label=gate["trust_label"],  # Estimated (or Validated) — carried from the gate
+        flags=gate["flags"],
+        figure_ref=f"{tool_name}::{well_id}",
+        figure=figure,  # → UI only; the engine strips it before the model sees it
+    )
+
+
+def probe_delta_p_readiness(
+    tool_name: str,
+    telemetry_df: pd.DataFrame,
+    production_df: pd.DataFrame,
+    well_id: str,
+    resolved_inputs_ctx: Optional[Dict[str, Any]],
+    rrc_depth_ft: Optional[float],
+) -> Dict[str, Any]:
+    """Front-load a ΔP tool's gate WITHOUT building a figure (Streamlit setup step).
+
+    Resolves depth/SG (real rrc + any overrides), runs the vendored ΔP compute, reads
+    PIP coverage, and runs the per-tool gate — returning the same ``{status,
+    trust_label, flags}`` head the tool will carry, plus the coverage + resolved-input
+    provenance. Lets the readiness surface show the Estimated label, the PIP coverage,
+    and which depth tier fired before the operator asks a question.
+    """
+    if telemetry_df is None or len(telemetry_df) == 0 or production_df is None or len(production_df) == 0:
+        return {
+            "gate": {"status": "blocked", "trust_label": None, "flags": ["telemetry_or_production_absent"]},
+            "coverage": {"n_present": 0, "n_total": 0, "fraction": 0.0},
+            "resolved": None,
+        }
+    resolved = delta_p_inputs.resolve_from_context(resolved_inputs_ctx, rrc_depth_ft)
+    analyzed, _meta = run_preprocessed_analysis(
+        telemetry_df,
+        production_df,
+        well_depth_ft=resolved.depth_ft,
+        sg_oil=resolved.sg_oil,
+        sg_water=resolved.sg_water,
+    )
+    coverage = delta_p_inputs.pip_coverage(analyzed)
+    gate = run_delta_p_tool_gate(tool_name, analyzed, resolved, coverage)
+    return {
+        "gate": gate,
+        "coverage": {k: coverage[k] for k in ("n_present", "n_total", "fraction") if k in coverage},
+        "resolved": resolved.as_values(),
+    }
+
+
+def delta_p_frequency(tool_input: Dict[str, Any]) -> Dict[str, Any]:
+    """Real ``delta_p_frequency``: ΔP_pump vs operating frequency over time (V3).
+
+    Pressure-lift response to motor frequency — the pump's measured differential
+    pressure against the frequency that drove it. Estimated trust (hydrostatic depth /
+    SG); blocked when PIP coverage is zero or motor frequency is absent.
+    """
+    return _run_delta_p_tool(
+        tool_input,
+        tool_name="delta_p_frequency",
+        figure_builder=build_delta_p_pump_vs_frequency,
+        value_projector=_project_dp_frequency_values,
+        title="ΔP Pump vs Motor Frequency",
+    )
+
+
+def delta_p_composition(tool_input: Dict[str, Any]) -> Dict[str, Any]:
+    """Real ``delta_p_composition``: ΔP_pump pressure-component decomposition over time (V10).
+
+    Decomposes downhole discharge pressure into its parts — pump intake, hydrostatic
+    column, tubing pressure, and the resulting discharge — so the operator sees what
+    builds the ΔP_pump. Same Estimated trust + PIP coverage handling as
+    ``delta_p_frequency``; blocked when PIP coverage is zero or the pressure components
+    are absent.
+    """
+    return _run_delta_p_tool(
+        tool_input,
+        tool_name="delta_p_composition",
+        figure_builder=build_delta_p_composition,
+        value_projector=_project_dp_composition_values,
+        title="Temporal ΔP Composition",
+    )
+
+
 # --- M1 stub tools (still mock; real in M4) ------------------------------------
 
 
@@ -364,6 +645,70 @@ _WATER_CUT_GOR_HISTORY_SPEC = {
     }
 }
 
+_DELTA_P_FREQUENCY_SPEC = {
+    "toolSpec": {
+        "name": "delta_p_frequency",
+        "description": (
+            "Retrieve the selected well's pump differential pressure (ΔP across the "
+            "pump, discharge minus intake) plotted against motor frequency over a time "
+            "window — the pressure-lift response to operating frequency. Use for "
+            "questions about pump ΔP, pressure rise/lift across the pump, head vs "
+            "frequency, or 'how is the pump's differential pressure responding to "
+            "frequency'. Note: ΔP_pump (discharge − intake), not stage/TDH ΔP, and "
+            "intake (PIP) is measured-only. The well is already set up for this "
+            "session — supply only the time window."
+        ),
+        "inputSchema": {
+            "json": {
+                "type": "object",
+                "properties": {
+                    "start_date": {
+                        "type": "string",
+                        "description": "Window start (ISO date YYYY-MM-DD), optional.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Window end (ISO date YYYY-MM-DD), optional.",
+                    },
+                },
+                "required": [],
+            }
+        },
+    }
+}
+
+_DELTA_P_COMPOSITION_SPEC = {
+    "toolSpec": {
+        "name": "delta_p_composition",
+        "description": (
+            "Retrieve the selected well's pump pressure decomposition over a time "
+            "window — how downhole discharge pressure is built from pump intake (PIP), "
+            "the hydrostatic column, and tubing pressure, and the resulting ΔP across "
+            "the pump. Use for questions about the pressure components, what makes up "
+            "the pump's differential pressure, hydrostatic vs tubing contribution, or "
+            "'break down the pump pressure'. Intake (PIP) is measured-only; depth/SG "
+            "for the hydrostatic term are resolved with provenance. The well is already "
+            "set up for this session — supply only the time window."
+        ),
+        "inputSchema": {
+            "json": {
+                "type": "object",
+                "properties": {
+                    "start_date": {
+                        "type": "string",
+                        "description": "Window start (ISO date YYYY-MM-DD), optional.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Window end (ISO date YYYY-MM-DD), optional.",
+                    },
+                },
+                "required": [],
+            }
+        },
+    }
+}
+
 _CURVE_POSITION_SPEC = {
     "toolSpec": {
         "name": "curve_position",
@@ -402,6 +747,11 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "water_cut_gor_history": {
         "spec": _WATER_CUT_GOR_HISTORY_SPEC,
         "fn": water_cut_gor_history,
+    },
+    "delta_p_frequency": {"spec": _DELTA_P_FREQUENCY_SPEC, "fn": delta_p_frequency},
+    "delta_p_composition": {
+        "spec": _DELTA_P_COMPOSITION_SPEC,
+        "fn": delta_p_composition,
     },
     "curve_position": {"spec": _CURVE_POSITION_SPEC, "fn": curve_position},
 }

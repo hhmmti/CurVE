@@ -168,10 +168,14 @@ def run_curve_turn(
             else:
                 # Backend-inject org/well from the session record (merged with the
                 # model's selectors; backend wins — the model never supplies them).
+                # Also inject the operator-controlled resolved-input overrides
+                # (depth/SG for the ΔP tools): setup-injected, user-controlled context,
+                # NOT model-facing tool args — same handling as org/well.
                 tool_input = dict(tool_use.get("input", {}) or {})
                 if session is not None:
                     tool_input["organization_id"] = session.get("organization_id")
                     tool_input["well_id"] = session.get("well_id")
+                    tool_input["resolved_inputs"] = session.get("resolved_inputs") or {}
                 result = entry["fn"](tool_input)
 
             # The FULL envelope (incl. figure) is recorded for the UI/CLI; only the
