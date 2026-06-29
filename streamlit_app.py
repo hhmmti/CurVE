@@ -34,14 +34,21 @@ from typing import Any, Dict, List, Optional
 import streamlit as st
 
 from cli import _estimate_cost_usd  # reuse the M1 cost estimator (no logic copied)
-from curve import data, delta_p_inputs, session, well_depth
+from curve import data, delta_p_inputs, recommendations, session, well_depth
 from curve.engine import run_curve_turn
 from curve.gate import run_tool_gate
-from curve.tools import NON_MODEL_RESULT_KEYS, probe_delta_p_readiness
+from curve.tools import (
+    NON_MODEL_RESULT_KEYS,
+    probe_delta_p_readiness,
+    probe_recommendation_readiness,
+)
 
 # The ΔP history tools front-loaded at setup (Estimated-label tools) + the Validated
 # connection-free tools. Order drives the availability report rows.
 _DELTA_P_TOOLS = ("delta_p_frequency", "delta_p_composition")
+# The three recommendation-dependent tools (M3) — CurVE's second data path. They share
+# the recommendation-absence hard block, front-loaded here per-well.
+_REC_TOOLS = ("recommendation_comparison", "affinity_check", "energy_efficiency")
 
 DEFAULT_PROFILE = os.environ.get("CURVE_AWS_PROFILE", "roam-ai")
 
@@ -140,6 +147,17 @@ def _availability_probe(organization_id: str, well_id: str) -> Dict[str, Any]:
         )
         for tool in _DELTA_P_TOOLS
     }
+    # Front-load the recommendation tools' gate: fetch the latest recommendation ONCE
+    # (CurVE's second data path, the Athena mirror) and run each tool's gate head so the
+    # availability report shows recommendation-absence honestly per-well, BEFORE chat.
+    latest_rec = recommendations.fetch_latest_recommendation(organization_id, well_id)
+    rec_gates = {
+        tool: probe_recommendation_readiness(
+            tool, organization_id, well_id, resolved_inputs_ctx={},
+            rrc_depth_ft=rrc_depth_ft, latest_row=latest_rec,
+        )
+        for tool in _REC_TOOLS
+    }
     return {
         "gate": run_tool_gate("production_history", telemetry_df, production_df),
         # Second connection-free Validated tool — same data, same gate keys.
@@ -147,6 +165,8 @@ def _availability_probe(organization_id: str, well_id: str) -> Dict[str, Any]:
         "coverage": _coverage(telemetry_df, production_df),
         "rrc_depth_ft": rrc_depth_ft,
         "delta_p": delta_p_gates,
+        "recommendation": rec_gates,
+        "recommendation_present": recommendations.has_recommendation(latest_rec),
     }
 
 
@@ -261,12 +281,89 @@ def _render_dp_kpis(values: Dict[str, Any]) -> None:
         )
 
 
+def _render_recommendation_comparison_kpis(values: Dict[str, Any]) -> None:
+    """KPI cards for recommendation_comparison — current vs recommended setpoint + deltas."""
+    freq = (values or {}).get("motor_frequency_hz") or {}
+    tp = (values or {}).get("tubing_pressure_psi") or {}
+    liq = (values or {}).get("liquid_rate_bpd") or {}
+    oil = (values or {}).get("oil_rate_bpd") or {}
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        "Motor frequency",
+        f"{freq.get('recommended'):.1f} Hz" if freq.get("recommended") is not None else "—",
+        delta=f"{freq.get('delta'):+.1f} Hz" if freq.get("delta") is not None else None,
+    )
+    c2.metric(
+        "Tubing pressure",
+        f"{tp.get('recommended'):.0f} psi" if tp.get("recommended") is not None else "—",
+        delta=f"{tp.get('delta'):+.0f} psi" if tp.get("delta") is not None else None,
+    )
+    c3.metric(
+        "Liquid rate",
+        f"{liq.get('recommended'):.0f} bbl/d" if liq.get("recommended") is not None else "—",
+        delta=f"{liq.get('delta'):+.0f} bbl/d" if liq.get("delta") is not None else None,
+    )
+    c4.metric(
+        "Oil rate",
+        f"{oil.get('recommended'):.0f} bbl/d" if oil.get("recommended") is not None else "—",
+        delta=f"{oil.get('delta'):+.0f} bbl/d" if oil.get("delta") is not None else None,
+    )
+    if values and values.get("recommendation_uuid"):
+        st.caption(
+            f"Recommendation `{values.get('recommendation_uuid')}` · goal: "
+            f"{values.get('method')}"
+        )
+
+
+def _render_affinity_kpis(values: Dict[str, Any]) -> None:
+    """KPI cards for affinity_check — speed ratio + per-check agreement."""
+    flow = (values or {}).get("flow_check") or {}
+    pressure = (values or {}).get("pressure_check") or {}
+
+    c1, c2, c3, c4 = st.columns(4)
+    sr = (values or {}).get("speed_ratio")
+    c1.metric("Speed ratio (N₂/N₁)", f"{sr:.3f}" if sr is not None else "—")
+    fd = (values or {}).get("frequency_delta_hz")
+    c2.metric("Frequency Δ", f"{fd:+.2f} Hz" if fd is not None else "—")
+    c3.metric("Flow agreement", flow.get("agreement") or "—")
+    c4.metric("Overall", (values or {}).get("overall_agreement") or "—")
+    if pressure.get("available"):
+        st.caption(
+            f"Pressure check: {pressure.get('agreement')} "
+            f"(Δ {pressure.get('difference_pct')}%) · mode: {(values or {}).get('mode')}"
+        )
+
+
+def _render_energy_kpis(values: Dict[str, Any]) -> None:
+    """KPI cards for energy_efficiency — efficiency + specific power + power source."""
+    cur = (values or {}).get("current") or {}
+    terms = (values or {}).get("term_provenance") or {}
+
+    eff = cur.get("direct_power_efficiency_pct")
+    eff = eff if eff is not None else cur.get("proxy_power_efficiency_pct")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pump efficiency", f"{eff:.1f}%" if eff is not None else "—")
+    sp = cur.get("specific_power_kwh_per_liquid_bbl")
+    c2.metric("Specific power", f"{sp:.2f} kWh/bbl" if sp is not None else "—")
+    hp = cur.get("hydraulic_kw_estimate")
+    c3.metric("Hydraulic power", f"{hp:.1f} kW" if hp is not None else "—")
+    c4.metric("Power source", (cur.get("power_source") or "—"))
+    st.caption(
+        f"Term provenance — liquid: {terms.get('liquid')} · ΔP: {terms.get('delta_p')} "
+        f"· power: {terms.get('power')} (overall = weakest)"
+    )
+
+
 # Physics tools whose envelopes render as figure + KPI block; name → KPI renderer.
 _TOOL_KPI_RENDERERS = {
     "production_history": _render_kpis,
     "water_cut_gor_history": _render_wcg_kpis,
     "delta_p_frequency": _render_dp_kpis,
     "delta_p_composition": _render_dp_kpis,
+    "recommendation_comparison": _render_recommendation_comparison_kpis,
+    "affinity_check": _render_affinity_kpis,
+    "energy_efficiency": _render_energy_kpis,
 }
 
 
@@ -485,6 +582,10 @@ def render_page() -> None:
                                 }
                                 for t in _DELTA_P_TOOLS
                             },
+                            # The three recommendation tools' gate heads (incl. the
+                            # recommendation-absence block when no rec exists).
+                            **{t: probe["recommendation"][t]["gate"] for t in _REC_TOOLS},
+                            "recommendation_present": probe.get("recommendation_present"),
                         },
                     )
                 )
@@ -502,13 +603,18 @@ def render_page() -> None:
     availability = record.get("availability") or {}
     gate = availability.get("production_history", {})
     coverage = availability.get("coverage") or {}
-    available = gate.get("status") == "available"
+    telemetry_available = gate.get("status") == "available"
+    # The recommendation tools (second data path) are usable whenever a recommendation
+    # exists — independent of telemetry presence. Chat proceeds if EITHER path is live.
+    rec_available = availability.get("recommendation_present", False)
+    available = telemetry_available or rec_available
     with st.container():
         st.subheader(f"Well {record['well_id']} — availability")
         for tool_name in (
             "production_history",
             "water_cut_gor_history",
             *_DELTA_P_TOOLS,
+            *_REC_TOOLS,
         ):
             tool_gate = availability.get(tool_name, {})
             cols = st.columns([1, 3])
@@ -526,11 +632,19 @@ def render_page() -> None:
 
     # --- editable ΔP physics inputs (depth + SG overrides) --------------------
     _render_delta_p_input_overrides(record, availability)
-    if not available:
+    if not telemetry_available:
         st.warning(
-            "Telemetry + production not both present for this well — "
-            "the connection-free tools are unavailable. Pick another well."
+            "Telemetry + production not both present for this well — the "
+            "telemetry-history tools are unavailable."
+            + (
+                " A recommendation IS available, so the recommendation tools "
+                "(recommendation_comparison / affinity_check / energy_efficiency) "
+                "can still answer."
+                if rec_available
+                else " No recommendation is available either — pick another well."
+            )
         )
+    if not available:
         return
 
     # --- chat -----------------------------------------------------------------
@@ -542,7 +656,10 @@ def render_page() -> None:
             else:
                 _render_answer(entry, dev_mode)
 
-    question = st.chat_input("Ask about this well's production, water cut, or GOR history…")
+    question = st.chat_input(
+        "Ask about this well's production, water cut/GOR, ΔP, or the ML "
+        "recommendation (comparison, affinity check, energy efficiency)…"
+    )
     if question:
         st.session_state["chat"].append({"role": "user", "text": question})
         with st.chat_message("user"):

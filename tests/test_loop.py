@@ -224,6 +224,9 @@ def test_real_registry_specs_are_converse_shaped():
         "water_cut_gor_history",
         "delta_p_frequency",
         "delta_p_composition",
+        "recommendation_comparison",
+        "affinity_check",
+        "energy_efficiency",
         "curve_position",
     }
     for name, entry in TOOL_REGISTRY.items():

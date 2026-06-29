@@ -17,4 +17,7 @@ TEST_QUESTIONS: List[Tuple[str, str]] = [
     ("Is well A-3 watering up over the last few months?", "water_cut_gor_history"),
     ("Where is my pump operating on its curve right now for well W-12?", "curve_position"),
     ("Am I running near the best efficiency point on well B-7?", "curve_position"),
+    ("What setpoint change does the model recommend for well W-12?", "recommendation_comparison"),
+    ("Does the recommended frequency change obey the affinity laws on well A-3?", "affinity_check"),
+    ("How energy-efficient is well W-12 running right now?", "energy_efficiency"),
 ]

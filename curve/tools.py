@@ -32,18 +32,31 @@ from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
 
+from compute import ml_recommendation_calcs
+from compute.affinity_validator import compute_affinity_law_validator
+from compute.energy_efficiency import compute_energy_efficiency_diagnostic
 from compute.preprocessed_calcs import WELL_DEPTH_FT
+from plotting.affinity_charts import build_affinity_law_panel
+from plotting.energy_charts import build_energy_power_cards
 from plotting.preprocessed_charts import (
     build_allocation_temporal,
     build_delta_p_composition,
     build_delta_p_pump_vs_frequency,
     build_water_cut_gor_analysis,
 )
+from plotting.recommendation_compare_charts import build_recommendation_comparison_bars
 
-from . import data, delta_p_inputs, well_depth
+from . import data, delta_p_inputs, recommendations, well_depth
 from ._vendored import preprocessed_pipeline_service
 from .envelope import error_envelope, success_envelope
-from .gate import run_delta_p_tool_gate, run_tool_gate
+from .gate import (
+    recommendation_absence_block,
+    run_affinity_check_gate,
+    run_delta_p_tool_gate,
+    run_energy_efficiency_gate,
+    run_recommendation_comparison_gate,
+    run_tool_gate,
+)
 
 # Vendored pipeline fns (loaded by path to skip the broken services/__init__.py).
 prepare_daily_data = preprocessed_pipeline_service.prepare_daily_data
@@ -575,6 +588,496 @@ def delta_p_composition(tool_input: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+# --- recommendation-dependent tools (M3) --------------------------------------
+# The three tools on CurVE's SECOND data path (the recommendation payload, read from
+# the Athena mirror per CurVE-decisions §9). They share v1's FIRST hard block — the
+# recommendation-absence block — and never synthesize a recommendation when none
+# exists. The recommendation is session-controlled context (fetched per turn from the
+# injected org/well), NEVER a model-facing Converse arg. Org/well + depth/SG overrides
+# arrive backend-injected in ``tool_input``; the Converse spec exposes no args.
+
+
+def _rec_method(tool_input: Dict[str, Any]) -> str:
+    """The recommendation goal/method branch — session-controlled, not a model arg.
+
+    Read from the session's ``resolved_inputs`` (like depth/SG overrides); defaults to
+    the app's ``max_oil`` goal. The VE keys the recommended setpoint on the goal
+    function — this is that goal.
+    """
+    ctx = tool_input.get("resolved_inputs") or {}
+    return ctx.get("recommendation_method") or recommendations.DEFAULT_RECOMMENDATION_METHOD
+
+
+def _resolve_current_power_kw(summary_map: Dict[str, Any]):
+    """Resolve current-state power (kW) + its provenance from the rec summary snapshot.
+
+    Returns ``(power_kw, source, term_label)``:
+      * direct ``motor_power_kw`` channel (``…_1d_avg`` / bare) → term **Validated**;
+      * else amp×volt 3-phase via the VE's method (PF 0.85) → term **Proxy** (v1's
+        first Proxy label);
+      * else ``(None, None, None)`` — no power source (the tool blocks).
+    PIP-style measured-or-missing: power is never defaulted/fabricated.
+    """
+    if not isinstance(summary_map, dict):
+        return None, None, None
+
+    direct = _first_num(
+        summary_map.get("motor_power_kw_1d_avg"),
+        summary_map.get("motor_power_kw"),
+    )
+    if direct is not None and direct > 0:
+        return direct, "motor_power_kw", "Validated"
+
+    amps = _first_num(
+        summary_map.get("motor_amps_1d_avg"),
+        summary_map.get("motor_amps_1h_avg"),
+        summary_map.get("motor_amps"),
+    )
+    volts = _first_num(
+        summary_map.get("motor_volts_1d_avg"),
+        summary_map.get("motor_volts_1h_avg"),
+        summary_map.get("motor_volts"),
+    )
+    proxy_kw = recommendations.ve_power_kw_from_amps_volts(amps, volts)
+    if proxy_kw is not None and proxy_kw > 0:
+        return proxy_kw, "amp_x_volt", "Proxy"
+
+    return None, None, None
+
+
+def _first_num(*candidates: Any) -> Optional[float]:
+    """First finite positive-or-any float among candidates, else None."""
+    for value in candidates:
+        v = _round(value, 6)
+        if v is not None:
+            return v
+    return None
+
+
+# --- real tool: recommendation_comparison -------------------------------------
+
+
+def _project_recommendation_comparison_values(
+    well_id: str, latest_row: Dict[str, Any], compare_row: Dict[str, Any], method: str
+) -> Dict[str, Any]:
+    """Narration payload for recommendation_comparison — current vs recommended deltas.
+
+    Faithful extraction relative to the payload (no physics). Surfaces the rec uuid for
+    traceability and the per-metric current/recommended/delta for frequency, tubing
+    pressure, and the production rates.
+    """
+    def _triple(cur_key: str, rec_key: str, delta_key: str, nd: int = 1):
+        return {
+            "current": _round(compare_row.get(cur_key), nd),
+            "recommended": _round(compare_row.get(rec_key), nd),
+            "delta": _round(compare_row.get(delta_key), nd),
+        }
+
+    return {
+        "well_id": well_id,
+        "recommendation_uuid": latest_row.get("uuid"),
+        "method": method,
+        "motor_frequency_hz": _triple(
+            "cur_motor_frequency_hz", "rec_motor_frequency_hz", "delta_motor_frequency_hz"
+        ),
+        "tubing_pressure_psi": _triple(
+            "cur_tubing_pressure_psi", "rec_tubing_pressure_psi", "delta_tubing_pressure_psi"
+        ),
+        "liquid_rate_bpd": _triple(
+            "cur_liquid_rate_bpd", "rec_liquid_rate_bpd", "delta_liquid_rate_bpd"
+        ),
+        "oil_rate_bpd": _triple("cur_oil", "rec_oil", "delta_oil"),
+        "water_rate_bpd": _triple("cur_water", "rec_water", "delta_water"),
+        "gas_rate": _triple("cur_gas", "rec_gas", "delta_gas"),
+    }
+
+
+def recommendation_comparison(tool_input: Dict[str, Any]) -> Dict[str, Any]:
+    """Real ``recommendation_comparison``: fetch rec (Athena mirror) → absence gate →
+    faithful extract → figure → envelope. **Validated relative to the payload** — no
+    physics; it reports what the recommendation says, not a field-validation of it.
+
+    Blocks ``not-ready / recommendation_absent`` when no recommendation exists for the
+    well/session (v1's first hard block); never synthesizes one.
+    """
+    organization_id = tool_input.get("organization_id")
+    well_id = tool_input.get("well_id")
+    if not organization_id or not well_id:
+        return error_envelope("blocked", ["missing_org_or_well_injection"])
+
+    method = _rec_method(tool_input)
+    try:
+        latest_row = recommendations.fetch_latest_recommendation(organization_id, well_id)
+        if not recommendations.has_recommendation(latest_row):
+            gate = recommendation_absence_block()
+            return error_envelope(gate["status"], gate["flags"], well_id=well_id)
+
+        compare_row = recommendations.extract_operating_point(latest_row, method)
+        gate = run_recommendation_comparison_gate(compare_row)
+        if gate["status"] != "available":
+            return error_envelope(gate["status"], gate["flags"], well_id=well_id)
+
+        figure = build_recommendation_comparison_bars(
+            compare_row, title=f"Current vs Recommended — {well_id}"
+        )
+        values = _project_recommendation_comparison_values(
+            well_id, latest_row, compare_row, method
+        )
+    except Exception as exc:  # data/parse failure → structured envelope, not an exception
+        return error_envelope("error", [f"data_or_compute_error: {exc}"], well_id=well_id)
+
+    return success_envelope(
+        values=values,
+        trust_label=gate["trust_label"],  # Validated (rel. payload) — carried from gate
+        flags=gate["flags"],
+        figure_ref=f"recommendation_comparison::{well_id}",
+        figure=figure,
+    )
+
+
+# --- real tool: affinity_check ------------------------------------------------
+
+
+def _project_affinity_values(
+    well_id: str,
+    diagnostic: Dict[str, Any],
+    compare_row: Dict[str, Any],
+    resolved: "delta_p_inputs.DeltaPInputs",
+) -> Dict[str, Any]:
+    """Narration payload for affinity_check — speed ratio + per-check agreement."""
+    flow = diagnostic.get("flow_check") or {}
+    pressure = diagnostic.get("pressure_check") or {}
+    power = diagnostic.get("power_check") or {}
+    return {
+        "well_id": well_id,
+        "mode": diagnostic.get("mode"),
+        "speed_ratio": _round(diagnostic.get("speed_ratio"), 3),
+        "frequency_delta_hz": _round(diagnostic.get("frequency_delta_hz"), 2),
+        "frequency_change_label": diagnostic.get("frequency_change_label"),
+        "overall_agreement": diagnostic.get("overall_label"),
+        "flow_check": {
+            "available": flow.get("available"),
+            "agreement": flow.get("agreement_label"),
+            "predicted_liquid_rate_bpd": _round(flow.get("affinity_predicted_liquid_rate_bpd")),
+            "recommended_liquid_rate_bpd": _round(flow.get("ml_recommended_liquid_rate_bpd")),
+            "difference_pct": _round(flow.get("difference_pct"), 1),
+        },
+        "pressure_check": {
+            "available": pressure.get("available"),
+            "agreement": pressure.get("agreement_label"),
+            "difference_pct": _round(pressure.get("difference_pct"), 1),
+        },
+        "power_check": {
+            "available": power.get("available"),
+            "agreement": power.get("agreement_label"),
+            "power_source": power.get("power_source_label"),
+        },
+        "inputs": resolved.as_values(),
+    }
+
+
+def affinity_check(tool_input: Dict[str, Any]) -> Dict[str, Any]:
+    """Real ``affinity_check``: affinity-law validation from the recommended freq + rates.
+
+    Flow check rides on payload freq + liquid rate (Validated); the pressure check uses
+    ΔP whose depth/SG provenance is carried by the resolution layer (Estimated unless
+    every input is real). Labeled by the #4 provenance rule (weakest-wins): **Validated**
+    if all inputs measured/from-payload, **Estimated** if any default feeds in (Proxy if
+    proxy power feeds in). Blocks ``recommendation_absent`` when no recommendation exists.
+
+    This is affinity *check / validation* — NOT an affinity *recommendation*; it never
+    proposes a setpoint.
+    """
+    organization_id = tool_input.get("organization_id")
+    well_id = tool_input.get("well_id")
+    resolved_inputs_ctx = tool_input.get("resolved_inputs")
+    if not organization_id or not well_id:
+        return error_envelope("blocked", ["missing_org_or_well_injection"])
+
+    method = _rec_method(tool_input)
+    try:
+        latest_row = recommendations.fetch_latest_recommendation(organization_id, well_id)
+        if not recommendations.has_recommendation(latest_row):
+            gate = recommendation_absence_block()
+            return error_envelope(gate["status"], gate["flags"], well_id=well_id)
+
+        compare_row = recommendations.extract_operating_point(latest_row, method)
+
+        # Resolve depth/SG (real rrc → override → default) so the ΔP pressure check can
+        # run with explicit provenance — the same resolution layer the ΔP tools use.
+        rrc_depth_ft = well_depth.fetch_well_depth_ft(well_id)
+        resolved = delta_p_inputs.resolve_from_context(resolved_inputs_ctx, rrc_depth_ft)
+        summary = recommendations.summary_blob(latest_row)
+        compare_row = ml_recommendation_calcs.augment_with_delta_p_pump(
+            compare_row, summary, resolved.depth_ft, resolved.sg_oil, resolved.sg_water
+        )
+
+        cur_dp = _round(compare_row.get("cur_delta_p_pump_psi"))
+        rec_dp = _round(compare_row.get("rec_delta_p_pump_psi"))
+        pressure_available = cur_dp is not None and rec_dp is not None
+
+        # Optional power check — current/recommended direct power only (recommended amps
+        # are not predicted). Usually unavailable → flow/pressure-only modes.
+        summary_map = ml_recommendation_calcs.parse_json_summary_data(summary)
+        cur_power, cur_src, cur_term = _resolve_current_power_kw(summary_map)
+        rec_power = _first_num(compare_row.get("rec_motor_power_kw"))
+        power_term_label = None
+        power_source_label = None
+        if cur_power is not None and rec_power is not None:
+            power_term_label = cur_term
+            power_source_label = cur_src
+        else:
+            cur_power = rec_power = None  # don't run a half-populated power check
+
+        diagnostic = compute_affinity_law_validator(
+            current_frequency_hz=compare_row.get("cur_motor_frequency_hz"),
+            recommended_frequency_hz=compare_row.get("rec_motor_frequency_hz"),
+            current_liquid_rate_bpd=compare_row.get("cur_liquid_rate_bpd"),
+            recommended_liquid_rate_bpd=compare_row.get("rec_liquid_rate_bpd"),
+            current_delta_p_psi=compare_row.get("cur_delta_p_pump_psi") if pressure_available else None,
+            recommended_delta_p_psi=compare_row.get("rec_delta_p_pump_psi") if pressure_available else None,
+            current_power=cur_power,
+            recommended_power=rec_power,
+            power_source_label=power_source_label,
+        )
+
+        gate = run_affinity_check_gate(
+            compare_row,
+            resolved,
+            pressure_available=pressure_available,
+            power_term_label=power_term_label,
+        )
+        if gate["status"] != "available":
+            return error_envelope(gate["status"], gate["flags"], well_id=well_id)
+
+        figure = build_affinity_law_panel(diagnostic)
+        values = _project_affinity_values(well_id, diagnostic, compare_row, resolved)
+    except Exception as exc:
+        return error_envelope("error", [f"data_or_compute_error: {exc}"], well_id=well_id)
+
+    return success_envelope(
+        values=values,
+        trust_label=gate["trust_label"],  # weakest-wins per provenance — carried from gate
+        flags=gate["flags"],
+        figure_ref=f"affinity_check::{well_id}",
+        figure=figure,
+    )
+
+
+# --- real tool: energy_efficiency ---------------------------------------------
+
+
+def _project_energy_values(
+    well_id: str,
+    current_diag: Dict[str, Any],
+    rec_diag: Dict[str, Any],
+    resolved: "delta_p_inputs.DeltaPInputs",
+    terms: Dict[str, Optional[str]],
+) -> Dict[str, Any]:
+    """Narration payload for energy_efficiency — current-state efficiency + term provenance."""
+    def _state(diag: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "available": diag.get("available"),
+            "mode": diag.get("mode"),
+            "power_source": diag.get("power_source_label"),
+            "liquid_rate_bpd": _round(diag.get("liquid_rate_bpd")),
+            "delta_p_psi": _round(diag.get("delta_p_psi")),
+            "hydraulic_kw_estimate": _round(diag.get("hydraulic_kw_estimate"), 2),
+            "motor_power_kw": _round(diag.get("motor_power_kw"), 2),
+            "proxy_power_kw": _round(diag.get("proxy_power_kw"), 2),
+            "direct_power_efficiency_pct": _round(diag.get("direct_power_efficiency_pct"), 1),
+            "proxy_power_efficiency_pct": _round(diag.get("proxy_power_efficiency_pct"), 1),
+            "specific_power_kwh_per_liquid_bbl": _round(
+                diag.get("specific_power_kwh_per_liquid_bbl"), 3
+            ),
+        }
+
+    return {
+        "well_id": well_id,
+        "current": _state(current_diag),
+        "recommended": _state(rec_diag),
+        "term_provenance": {
+            "liquid": terms.get("liquid"),
+            "delta_p": terms.get("delta_p"),
+            "power": terms.get("power"),
+        },
+        "inputs": resolved.as_values(),
+    }
+
+
+def _energy_diag_for_state(compare_row: Dict[str, Any], summary_map: Dict[str, Any], state: str):
+    """Compute one state's (current/recommended) energy diagnostic + power provenance.
+
+    Current state: measured liquid/oil + Estimated ΔP + power (direct→Validated /
+    amp×volt→Proxy). Recommended state: model liquid/oil + recommended ΔP + direct
+    power only (best-effort; usually unavailable). Returns ``(diagnostic, power_term)``.
+    """
+    if state == "current":
+        liquid = compare_row.get("cur_liquid_rate_bpd")
+        oil = compare_row.get("cur_oil")
+        dp = compare_row.get("cur_delta_p_pump_psi")
+        power_kw, power_src, power_term = _resolve_current_power_kw(summary_map)
+    else:
+        liquid = compare_row.get("rec_liquid_rate_bpd")
+        oil = compare_row.get("rec_oil")
+        dp = compare_row.get("rec_delta_p_pump_psi")
+        # Recommended power: direct channel only (amps/volts are not predicted).
+        power_kw = _first_num(compare_row.get("rec_motor_power_kw"))
+        power_src = "motor_power_kw" if power_kw is not None else None
+        power_term = "Validated" if power_kw is not None else None
+
+    diagnostic = compute_energy_efficiency_diagnostic(
+        liquid_rate_bpd=liquid,
+        delta_p_psi=dp,
+        motor_power_kw=power_kw if power_src == "motor_power_kw" else None,
+        proxy_power_kw=power_kw if power_src == "amp_x_volt" else None,
+        oil_rate_bpd=oil,
+        power_source_label=power_src,
+    )
+    return diagnostic, power_term
+
+
+def energy_efficiency(tool_input: Dict[str, Any]) -> Dict[str, Any]:
+    """Real ``energy_efficiency``: hydraulic-power efficiency for the current operating
+    state, anchored by the recommendation payload's measured snapshot.
+
+    Three terms with INDEPENDENT provenance, folded weakest-wins (v1's first multi-tier
+    label): liquid (measured → **Validated**) + ΔP (depth/SG via the resolution layer →
+    **Estimated**) + power (direct ``motor_power_kw`` → **Validated**; amp×volt proxy →
+    **Proxy**, v1's first Proxy label). Overall label = the WEAKEST term — never the
+    strongest. Blocks ``recommendation_absent`` when no recommendation exists, and
+    blocks when a required term (liquid/ΔP/power) is unresolved.
+    """
+    organization_id = tool_input.get("organization_id")
+    well_id = tool_input.get("well_id")
+    resolved_inputs_ctx = tool_input.get("resolved_inputs")
+    if not organization_id or not well_id:
+        return error_envelope("blocked", ["missing_org_or_well_injection"])
+
+    method = _rec_method(tool_input)
+    try:
+        latest_row = recommendations.fetch_latest_recommendation(organization_id, well_id)
+        if not recommendations.has_recommendation(latest_row):
+            gate = recommendation_absence_block()
+            return error_envelope(gate["status"], gate["flags"], well_id=well_id)
+
+        compare_row = recommendations.extract_operating_point(latest_row, method)
+
+        # ΔP needs depth/SG (Estimated provenance) + the measured intake from the summary
+        # snapshot (measured-or-missing). Same resolution layer the ΔP tools use.
+        rrc_depth_ft = well_depth.fetch_well_depth_ft(well_id)
+        resolved = delta_p_inputs.resolve_from_context(resolved_inputs_ctx, rrc_depth_ft)
+        summary = recommendations.summary_blob(latest_row)
+        compare_row = ml_recommendation_calcs.augment_with_delta_p_pump(
+            compare_row, summary, resolved.depth_ft, resolved.sg_oil, resolved.sg_water
+        )
+        summary_map = ml_recommendation_calcs.parse_json_summary_data(summary)
+
+        # Per-term provenance (current state is the headline; weakest-wins decides label).
+        liquid = _round(compare_row.get("cur_liquid_rate_bpd"))
+        cur_dp = _round(compare_row.get("cur_delta_p_pump_psi"))
+        _power_kw, _power_src, power_term = _resolve_current_power_kw(summary_map)
+        liquid_term = "Validated" if liquid is not None and liquid > 0 else None
+        delta_p_term = resolved.trust_label if cur_dp is not None and cur_dp > 0 else None
+
+        gate = run_energy_efficiency_gate(
+            liquid_term_label=liquid_term,
+            delta_p_term_label=delta_p_term,
+            power_term_label=power_term,
+            resolved_inputs=resolved,
+        )
+        if gate["status"] != "available":
+            return error_envelope(gate["status"], gate["flags"], well_id=well_id)
+
+        current_diag, _ = _energy_diag_for_state(compare_row, summary_map, "current")
+        rec_diag, _ = _energy_diag_for_state(compare_row, summary_map, "recommended")
+        figure = build_energy_power_cards(current_diag, rec_diag)
+        values = _project_energy_values(
+            well_id,
+            current_diag,
+            rec_diag,
+            resolved,
+            {"liquid": liquid_term, "delta_p": delta_p_term, "power": power_term},
+        )
+    except Exception as exc:
+        return error_envelope("error", [f"data_or_compute_error: {exc}"], well_id=well_id)
+
+    return success_envelope(
+        values=values,
+        trust_label=gate["trust_label"],  # weakest-wins across the three terms
+        flags=gate["flags"],
+        figure_ref=f"energy_efficiency::{well_id}",
+        figure=figure,
+    )
+
+
+# --- recommendation readiness probe (Streamlit front-load) ---------------------
+
+
+def probe_recommendation_readiness(
+    tool_name: str,
+    organization_id: str,
+    well_id: str,
+    resolved_inputs_ctx: Optional[Dict[str, Any]],
+    rrc_depth_ft: Optional[float],
+    latest_row: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Front-load a recommendation tool's gate WITHOUT building a figure (setup step).
+
+    Returns the same ``{status, trust_label, flags}`` head the tool will carry, so the
+    availability report shows the recommendation-absence block (honest per-well) and the
+    trust label before the operator asks a question. ``latest_row`` is fetched once at
+    setup and shared across the three tools (per-session re-read).
+    """
+    if not recommendations.has_recommendation(latest_row):
+        return {"gate": recommendation_absence_block()}
+
+    method = (resolved_inputs_ctx or {}).get("recommendation_method") or recommendations.DEFAULT_RECOMMENDATION_METHOD
+    compare_row = recommendations.extract_operating_point(latest_row, method)
+
+    if tool_name == "recommendation_comparison":
+        return {"gate": run_recommendation_comparison_gate(compare_row)}
+
+    resolved = delta_p_inputs.resolve_from_context(resolved_inputs_ctx, rrc_depth_ft)
+    summary = recommendations.summary_blob(latest_row)
+    compare_row = ml_recommendation_calcs.augment_with_delta_p_pump(
+        compare_row, summary, resolved.depth_ft, resolved.sg_oil, resolved.sg_water
+    )
+    summary_map = ml_recommendation_calcs.parse_json_summary_data(summary)
+
+    if tool_name == "affinity_check":
+        cur_dp = _round(compare_row.get("cur_delta_p_pump_psi"))
+        rec_dp = _round(compare_row.get("rec_delta_p_pump_psi"))
+        pressure_available = cur_dp is not None and rec_dp is not None
+        cur_power, _src, cur_term = _resolve_current_power_kw(summary_map)
+        rec_power = _first_num(compare_row.get("rec_motor_power_kw"))
+        power_term_label = cur_term if (cur_power is not None and rec_power is not None) else None
+        return {
+            "gate": run_affinity_check_gate(
+                compare_row, resolved,
+                pressure_available=pressure_available,
+                power_term_label=power_term_label,
+            )
+        }
+
+    if tool_name == "energy_efficiency":
+        liquid = _round(compare_row.get("cur_liquid_rate_bpd"))
+        cur_dp = _round(compare_row.get("cur_delta_p_pump_psi"))
+        _pk, _ps, power_term = _resolve_current_power_kw(summary_map)
+        liquid_term = "Validated" if liquid is not None and liquid > 0 else None
+        delta_p_term = resolved.trust_label if cur_dp is not None and cur_dp > 0 else None
+        return {
+            "gate": run_energy_efficiency_gate(
+                liquid_term_label=liquid_term,
+                delta_p_term_label=delta_p_term,
+                power_term_label=power_term,
+                resolved_inputs=resolved,
+            )
+        }
+
+    raise KeyError(f"Unknown recommendation tool: {tool_name}")
+
+
 # --- M1 stub tools (still mock; real in M4) ------------------------------------
 
 
@@ -709,6 +1212,62 @@ _DELTA_P_COMPOSITION_SPEC = {
     }
 }
 
+_RECOMMENDATION_COMPARISON_SPEC = {
+    "toolSpec": {
+        "name": "recommendation_comparison",
+        "description": (
+            "Retrieve the ML recommendation for the selected well and compare the "
+            "recommended operating point against the current one (motor frequency, "
+            "tubing pressure, and the resulting oil/water/gas/liquid rates, with the "
+            "delta for each). Use for questions about what the model recommends, the "
+            "recommended setpoint, current-vs-recommended, or 'what change is being "
+            "suggested'. This reports the recommendation faithfully; it is not a "
+            "physics validation of it. The well is already set up for this session — "
+            "no arguments are needed."
+        ),
+        "inputSchema": {
+            "json": {"type": "object", "properties": {}, "required": []}
+        },
+    }
+}
+
+_AFFINITY_CHECK_SPEC = {
+    "toolSpec": {
+        "name": "affinity_check",
+        "description": (
+            "Validate the ML recommendation against the pump Affinity Laws — whether "
+            "the recommended change in motor frequency is consistent with the implied "
+            "change in flow (and pump ΔP) under first-order affinity scaling (flow ∝ "
+            "speed, head ∝ speed²). Use for questions about whether the recommendation "
+            "obeys the affinity laws, is physically consistent, or 'does the frequency "
+            "change match the flow change'. This is a sanity CHECK of the recommendation, "
+            "not a new recommendation. The well is already set up for this session — no "
+            "arguments are needed."
+        ),
+        "inputSchema": {
+            "json": {"type": "object", "properties": {}, "required": []}
+        },
+    }
+}
+
+_ENERGY_EFFICIENCY_SPEC = {
+    "toolSpec": {
+        "name": "energy_efficiency",
+        "description": (
+            "Assess the selected well's energy efficiency at its current operating "
+            "point — hydraulic power vs input power, the resulting efficiency, and "
+            "specific power (kWh per barrel). Use for questions about pump/energy "
+            "efficiency, power consumption, kWh per barrel, or 'how efficiently is this "
+            "well running'. Power uses a direct motor-power channel when available, "
+            "otherwise an amp×volt proxy (labeled accordingly). The well is already set "
+            "up for this session — no arguments are needed."
+        ),
+        "inputSchema": {
+            "json": {"type": "object", "properties": {}, "required": []}
+        },
+    }
+}
+
 _CURVE_POSITION_SPEC = {
     "toolSpec": {
         "name": "curve_position",
@@ -753,6 +1312,12 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "spec": _DELTA_P_COMPOSITION_SPEC,
         "fn": delta_p_composition,
     },
+    "recommendation_comparison": {
+        "spec": _RECOMMENDATION_COMPARISON_SPEC,
+        "fn": recommendation_comparison,
+    },
+    "affinity_check": {"spec": _AFFINITY_CHECK_SPEC, "fn": affinity_check},
+    "energy_efficiency": {"spec": _ENERGY_EFFICIENCY_SPEC, "fn": energy_efficiency},
     "curve_position": {"spec": _CURVE_POSITION_SPEC, "fn": curve_position},
 }
 

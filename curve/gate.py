@@ -33,6 +33,43 @@ run_data_availability_gate = data_availability_gate.run_data_availability_gate
 # calculation contracts, the tool's label is the WORST among them (never inflated).
 _TRUST_PRECEDENCE: List[str] = ["Validated", "Estimated", "Proxy", "Research prototype"]
 
+# --- general weakest-wins trust precedence (M3, prompt #5/#4) ------------------
+# v1's first MULTI-TIER label fold. A tool that aggregates several term-level
+# provenances (e.g. energy_efficiency's liquid + ΔP + power) carries the WEAKEST term
+# as its overall label — never the strongest. Implemented GENERALLY here (not
+# hardcoded to one tool) so later multi-tier tools inherit it.
+#
+# Ordering, WEAKEST → strongest (the prompt's chain: not-ready < Proxy < Estimated <
+# Validated, with Research prototype below Proxy). ``not-ready``/``None`` is the
+# absolute weakest — it means a required term is unresolved, so the tool BLOCKS.
+NOT_READY = "not-ready"
+_TERM_PRECEDENCE_WEAK_TO_STRONG: List[str] = [
+    NOT_READY,
+    "Research prototype",
+    "Proxy",
+    "Estimated",
+    "Validated",
+]
+
+
+def weakest_trust(labels: List[Optional[str]]) -> str:
+    """Return the weakest (most-blocking) trust label among ``labels`` — weakest-wins.
+
+    ``None`` is normalized to ``not-ready`` (a missing/unresolved term). The result is
+    the lowest-ranked label by :data:`_TERM_PRECEDENCE_WEAK_TO_STRONG`. An empty list
+    is itself ``not-ready`` (nothing resolved). This is GENERAL: never inflate to the
+    strongest term, and a single ``not-ready`` term blocks the whole tool.
+    """
+    norm = [lbl if lbl is not None else NOT_READY for lbl in labels]
+    if not norm:
+        return NOT_READY
+    return min(
+        norm,
+        key=lambda lbl: _TERM_PRECEDENCE_WEAK_TO_STRONG.index(lbl)
+        if lbl in _TERM_PRECEDENCE_WEAK_TO_STRONG
+        else len(_TERM_PRECEDENCE_WEAK_TO_STRONG),
+    )
+
 # Per-tool → the vendored calculation-contract keys that back it. production_history
 # (V1 Allocation Temporal) is driven by the allocation calcs, all Validated.
 _TOOL_GATE_KEYS: Dict[str, List[str]] = {
@@ -251,3 +288,148 @@ def run_delta_p_tool_gate(
         )
 
     return {"status": "available", "trust_label": trust_label, "flags": flags}
+
+
+# --- recommendation-dependent tools: absence block + contract adapters (M3) ----
+# The three recommendation tools (recommendation_comparison, affinity_check,
+# energy_efficiency) sit on CurVE's SECOND data path (the recommendation payload).
+# They share v1's FIRST hard block — the recommendation-absence block — and adapt the
+# vendored rec/affinity/energy contracts (which already exist in the vendored gate,
+# wired in by the app's Page 2) to the CurVE per-tool envelope. We VERIFY + ADAPT
+# these contracts; we do not re-author them.
+
+# v1's FIRST hard block. When no recommendation exists for the well/session, every
+# recommendation tool returns this — a SEPARATE, NAMED label state, distinct from the
+# ΔP coverage block (``pip_coverage_zero``) and from Estimated. ``not-ready`` is the
+# status (the DoD wording); ``recommendation_absent`` is the reason. The narration is
+# instructed to state a recommendation isn't available and NOT synthesize one.
+RECOMMENDATION_ABSENT_FLAG = "recommendation_absent"
+
+
+def recommendation_absence_block() -> Dict[str, Any]:
+    """The shared recommendation-absence hard block (v1's first), per tool."""
+    return {
+        "status": "not-ready",
+        "trust_label": None,
+        "flags": [RECOMMENDATION_ABSENT_FLAG],
+    }
+
+
+def run_recommendation_comparison_gate(compare_row: Dict[str, Any]) -> Dict[str, Any]:
+    """Gate ``recommendation_comparison`` — faithful extraction, Validated-rel-payload.
+
+    Adapts the vendored ``recommendation_operating_point_extraction`` contract (output
+    label **Validated**: trust is direct *relative to the payload*, not field-validated
+    against the well). Readiness here means the comparison row carries the core
+    operating-point fields the payload extraction produces; a structurally-absent
+    payload is caught earlier by the absence block. No physics — no Estimated/Proxy.
+    """
+    context = {
+        "field_values": {
+            # The contract's two required keys are the presence of the parsed setpoint
+            # blobs; the compare row is the parsed result, so we present non-empty
+            # markers when the operating-point fields resolved.
+            "model_setpoint_recommendations": compare_row.get("rec_motor_frequency_hz"),
+            "current_setpoint": compare_row.get("cur_motor_frequency_hz"),
+        },
+    }
+    reports = run_data_availability_gate(
+        context, calculation_keys=["recommendation_operating_point_extraction"]
+    )
+    not_ready = [r for r in reports if not r.ready]
+    if not_ready:
+        flags = [
+            f"{r.calculation}: missing {', '.join(r.missing_fields)}" for r in not_ready
+        ]
+        return {"status": "blocked", "trust_label": None, "flags": flags}
+    # Validated relative to the payload (the contract's label, carried faithfully).
+    return {"status": "available", "trust_label": reports[0].output_label, "flags": []}
+
+
+def run_affinity_check_gate(
+    compare_row: Dict[str, Any],
+    resolved_inputs: Any,
+    *,
+    pressure_available: bool,
+    power_term_label: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Gate ``affinity_check`` — readiness via the vendored ``affinity_law_validator``
+    contract, then label by the #4 provenance rule (weakest-wins across terms).
+
+    Required (contract): current/recommended frequency + liquid rate (from the payload
+    → Validated when those alone feed the flow check). The pressure check (if run) uses
+    ΔP whose depth/SG provenance is carried by ``resolved_inputs`` (Estimated unless all
+    real). The power check (if run) carries its own term label (Validated/Proxy). The
+    overall label is the WEAKEST term — Validated only when every input is
+    measured/from-payload, Estimated when any default feeds in, Proxy on proxy power.
+    """
+    context = {
+        "field_values": {
+            "current_motor_frequency_hz": compare_row.get("cur_motor_frequency_hz"),
+            "recommended_motor_frequency_hz": compare_row.get("rec_motor_frequency_hz"),
+            "current_liquid_rate_bpd": compare_row.get("cur_liquid_rate_bpd"),
+            "recommended_liquid_rate_bpd": compare_row.get("rec_liquid_rate_bpd"),
+        },
+        "proxies_available": {"bhp_proxy", "amp_x_volt"},
+    }
+    reports = run_data_availability_gate(
+        context, calculation_keys=["affinity_law_validator"]
+    )
+    not_ready = [r for r in reports if not r.ready]
+    if not_ready:
+        flags = [
+            f"{r.calculation}: missing {', '.join(r.missing_fields)}" for r in not_ready
+        ]
+        return {"status": "blocked", "trust_label": None, "flags": flags}
+
+    # Term provenance (weakest-wins). Flow check rides on payload freq + rates →
+    # Validated. Pressure check (when run) inherits the ΔP depth/SG provenance.
+    terms: List[Optional[str]] = ["Validated"]
+    flags: List[str] = []
+    if pressure_available:
+        terms.append(resolved_inputs.trust_label)
+        flags.extend(resolved_inputs.flags)
+    if power_term_label is not None:
+        terms.append(power_term_label)
+        flags.append(f"power_term_{power_term_label.lower()}")
+
+    return {"status": "available", "trust_label": weakest_trust(terms), "flags": flags}
+
+
+def run_energy_efficiency_gate(
+    *,
+    liquid_term_label: Optional[str],
+    delta_p_term_label: Optional[str],
+    power_term_label: Optional[str],
+    resolved_inputs: Any,
+) -> Dict[str, Any]:
+    """Gate ``energy_efficiency`` — readiness via the vendored
+    ``energy_efficiency_diagnostic`` contract, then weakest-wins across its three terms.
+
+    Term labels are decided by the CALLER (the tool) from input provenance:
+      * liquid → Validated (measured liquid from the payload),
+      * ΔP     → ``resolved_inputs.trust_label`` (Estimated; depth/SG),
+      * power  → Validated (direct ``motor_power_kw`` channel) OR **Proxy** (amp×volt,
+                 v1's first Proxy label) OR ``None``/not-ready (no power source).
+    A ``None``/not-ready term blocks the tool (status ``blocked``) with a named flag.
+    Otherwise the overall label is the WEAKEST of the three (never the strongest) —
+    Validated liquid + Estimated ΔP + Proxy power → overall **Proxy**.
+    """
+    terms = [liquid_term_label, delta_p_term_label, power_term_label]
+    overall = weakest_trust(terms)
+    if overall == NOT_READY:
+        missing = []
+        if liquid_term_label is None:
+            missing.append("liquid_rate_absent")
+        if delta_p_term_label is None:
+            missing.append("delta_p_absent")
+        if power_term_label is None:
+            missing.append("power_source_absent")
+        return {"status": "blocked", "trust_label": None, "flags": missing or ["energy_inputs_absent"]}
+
+    # Flags name each term's provenance (the depth/SG source flags + the power tier).
+    flags: List[str] = list(getattr(resolved_inputs, "flags", []))
+    flags.append("liquid_validated")
+    if power_term_label is not None:
+        flags.append(f"power_term_{power_term_label.lower()}")
+    return {"status": "available", "trust_label": overall, "flags": flags}
