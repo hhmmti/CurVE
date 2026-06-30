@@ -18,6 +18,18 @@ from .delta_p_inputs import (
 )
 from .engine import MAX_ITERATIONS, run_curve_turn
 from .gate import run_delta_p_tool_gate, run_tool_gate
+from .ideal_catalog import (
+    DEFAULT_BEP_TOLERANCE,
+    annotate_candidates,
+    bep_tolerance_from_context,
+    build_coverage_report,
+    fetch_ideal_catalog,
+    make_pump_pick,
+    narrow_candidates,
+    resolve_total_fluid_bpd,
+    selectable_candidates,
+    set_pump_on_session,
+)
 from .prompt import CURVE_SYSTEM_PROMPT, format_setup_context
 from .session import (
     clear_sessions,
@@ -54,4 +66,14 @@ __all__ = [
     "load_session",
     "clear_sessions",
     "use_store",
+    "fetch_ideal_catalog",
+    "resolve_total_fluid_bpd",
+    "narrow_candidates",
+    "annotate_candidates",
+    "selectable_candidates",
+    "build_coverage_report",
+    "make_pump_pick",
+    "bep_tolerance_from_context",
+    "set_pump_on_session",
+    "DEFAULT_BEP_TOLERANCE",
 ]

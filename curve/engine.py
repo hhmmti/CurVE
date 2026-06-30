@@ -176,6 +176,12 @@ def run_curve_turn(
                     tool_input["organization_id"] = session.get("organization_id")
                     tool_input["well_id"] = session.get("well_id")
                     tool_input["resolved_inputs"] = session.get("resolved_inputs") or {}
+                    # M4: the manually-picked pump rides the same setup-injection path
+                    # as org/well — top-level, backend-injected, NOT a model-facing
+                    # Converse argument and NOT in any inputSchema. ``None`` until a
+                    # pump is picked (an honest "no connection yet" the 4b tool blocks
+                    # on, never a silent default). Connection-free tools ignore it.
+                    tool_input["pump"] = session.get("pump")
                 result = entry["fn"](tool_input)
 
             # The FULL envelope (incl. figure) is recorded for the UI/CLI; only the

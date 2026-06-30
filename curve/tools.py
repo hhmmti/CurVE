@@ -46,7 +46,7 @@ from plotting.preprocessed_charts import (
 )
 from plotting.recommendation_compare_charts import build_recommendation_comparison_bars
 
-from . import data, delta_p_inputs, recommendations, well_depth
+from . import data, delta_p_inputs, ideal_catalog, recommendations, well_depth
 from ._vendored import preprocessed_pipeline_service
 from .envelope import error_envelope, success_envelope
 from .gate import (
@@ -1076,6 +1076,65 @@ def probe_recommendation_readiness(
         }
 
     raise KeyError(f"Unknown recommendation tool: {tool_name}")
+
+
+# --- M4 / 4a: connection-resolution coverage probe ----------------------------
+# Front-loads the well ↔ pump connection layer at setup, mirroring the readiness
+# probes above: it does the orchestration (fetch telemetry/production → vendored
+# analysis → total fluid → BEP-narrow the re-read catalog) and returns the per-well
+# coverage report. It does NOT pick a pump (the operator does) and it does NOT touch
+# curve_position (that is 4b). The report is a de-risking check, never a gate.
+
+
+def probe_connection_coverage(
+    organization_id: str,
+    well_id: str,
+    catalog_df: pd.DataFrame,
+    resolved_inputs_ctx: Optional[Dict[str, Any]] = None,
+    *,
+    telemetry_df: Optional[pd.DataFrame] = None,
+    production_df: Optional[pd.DataFrame] = None,
+    rrc_depth_ft: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build the per-well pump-connection coverage report (setup-step orchestration).
+
+    Fetches telemetry + production (unless pre-fetched and passed in to avoid a double
+    read), runs the vendored preprocessed analysis to get the representative total fluid
+    (median liquid rate — independent of depth/SG), then BEP-narrows the re-read catalog
+    with the setup-injected tolerance. Returns
+    ``{report, total_fluid_bpd, n_candidates}``; ``report`` is the full
+    :func:`curve.ideal_catalog.build_coverage_report` dict (total fluid, candidate count,
+    candidate list, obsolete/excluded counts). Telemetry-absent → total fluid ``None`` →
+    zero candidates, surfaced honestly (never a fabricated rate or a default pump).
+    """
+    if telemetry_df is None or production_df is None:
+        telemetry_df, production_df = data.fetch_preprocessed_window(
+            organization_id, well_id
+        )
+
+    total_fluid_bpd: Optional[float] = None
+    if telemetry_df is not None and len(telemetry_df) and production_df is not None and len(production_df):
+        # Liquid rate is independent of depth/SG; resolve them only to satisfy the
+        # vendored analysis signature (defaults are fine for the total-fluid read).
+        resolved = delta_p_inputs.resolve_from_context(resolved_inputs_ctx, rrc_depth_ft)
+        analyzed, _meta = run_preprocessed_analysis(
+            telemetry_df,
+            production_df,
+            well_depth_ft=resolved.depth_ft,
+            sg_oil=resolved.sg_oil,
+            sg_water=resolved.sg_water,
+        )
+        total_fluid_bpd = ideal_catalog.resolve_total_fluid_bpd(analyzed)
+
+    bep_tolerance = ideal_catalog.bep_tolerance_from_context(resolved_inputs_ctx)
+    report = ideal_catalog.build_coverage_report(
+        catalog_df, total_fluid_bpd, well_id, bep_tolerance
+    )
+    return {
+        "report": report,
+        "total_fluid_bpd": total_fluid_bpd,
+        "n_candidates": report["n_candidates"],
+    }
 
 
 # --- M1 stub tools (still mock; real in M4) ------------------------------------

@@ -34,11 +34,12 @@ from typing import Any, Dict, List, Optional
 import streamlit as st
 
 from cli import _estimate_cost_usd  # reuse the M1 cost estimator (no logic copied)
-from curve import data, delta_p_inputs, recommendations, session, well_depth
+from curve import data, delta_p_inputs, ideal_catalog, recommendations, session, well_depth
 from curve.engine import run_curve_turn
 from curve.gate import run_tool_gate
 from curve.tools import (
     NON_MODEL_RESULT_KEYS,
+    probe_connection_coverage,
     probe_delta_p_readiness,
     probe_recommendation_readiness,
 )
@@ -126,6 +127,17 @@ def _coverage(telemetry_df, production_df) -> Dict[str, Any]:
 
 
 @st.cache_data(show_spinner=False)
+def _load_ideal_catalog():
+    """Re-read the ideal catalog once per session (cached across wells, same catalog).
+
+    Written to re-read each session (build-plan M4 seam) so Track 2's auto-connection
+    slots in with no rework. Obsolete rows are KEPT (CurVE deviation) — surfaced+flagged
+    downstream, never dropped.
+    """
+    return ideal_catalog.fetch_ideal_catalog()
+
+
+@st.cache_data(show_spinner=False)
 def _availability_probe(organization_id: str, well_id: str) -> Dict[str, Any]:
     """Front-load gate: fetch once + run the SHIPPED gate to build the availability report.
 
@@ -158,6 +170,18 @@ def _availability_probe(organization_id: str, well_id: str) -> Dict[str, Any]:
         )
         for tool in _REC_TOOLS
     }
+    # M4 / 4a: front-load the pump-connection coverage report (the de-risking check).
+    # Re-read the catalog, compute total fluid, BEP-narrow → candidate list. Reuses the
+    # already-fetched telemetry/production frames (no double read). Never a gate.
+    try:
+        connection = probe_connection_coverage(
+            organization_id, well_id, _load_ideal_catalog(),
+            resolved_inputs_ctx={},
+            telemetry_df=telemetry_df, production_df=production_df,
+            rrc_depth_ft=rrc_depth_ft,
+        )
+    except Exception as exc:  # catalog read / schema mismatch — surface, don't crash setup
+        connection = {"report": None, "error": str(exc), "n_candidates": 0}
     return {
         "gate": run_tool_gate("production_history", telemetry_df, production_df),
         # Second connection-free Validated tool — same data, same gate keys.
@@ -167,6 +191,7 @@ def _availability_probe(organization_id: str, well_id: str) -> Dict[str, Any]:
         "delta_p": delta_p_gates,
         "recommendation": rec_gates,
         "recommendation_present": recommendations.has_recommendation(latest_rec),
+        "connection": connection,
     }
 
 
@@ -513,6 +538,84 @@ def _render_delta_p_input_overrides(
         )
 
 
+def _render_pump_pick(record: Dict[str, Any], availability: Dict[str, Any]) -> None:
+    """Manual pump-pick UX (M4 / 4a) — VE proposes BEP-narrowed candidates; operator picks.
+
+    The §1 connection ladder, manual rung: candidates come from the BEP-narrowed catalog
+    (the coverage report front-loaded at setup); the operator selects one. The pick is a
+    setup-injected value stored on the session's ``pump`` field (``set_pump_on_session``),
+    NEVER a model-facing tool argument. No pick = an honest blocked state for 4b's
+    ``curve_position`` — never a silent default pump. Obsolete candidates are offered
+    (flagged), not hidden.
+    """
+    connection = availability.get("connection") or {}
+    report = connection.get("report")
+    with st.expander("🔌 Pump connection — manual pick (BEP-narrowed candidates)", expanded=True):
+        if connection.get("error"):
+            st.warning(f"Catalog/coverage unavailable: {connection['error']}")
+            return
+        if not report:
+            st.info("No connection coverage computed for this well.")
+            return
+
+        tf = report.get("total_fluid_bpd")
+        st.caption(
+            (f"Total fluid (median liquid rate): **{tf:,.0f} bpd** · " if tf is not None
+             else "Total fluid: **—** (telemetry absent) · ")
+            + f"BEP tolerance **±{report.get('bep_tolerance', 0)*100:.0f}%** · "
+            f"**{report.get('n_candidates', 0)}** selectable candidate(s) "
+            f"(of {report.get('n_bep_compatible', 0)} BEP-compatible; "
+            f"{report.get('n_excluded_missing_coeffs', 0)} excluded for missing curve coeffs)"
+        )
+
+        candidates = report.get("candidates") or []
+        if not candidates:
+            st.warning(
+                "No selectable candidates for this well's total fluid — no pump can be "
+                "picked, so curve-position questions will block honestly (4b). Widen the "
+                "BEP tolerance or verify the well's liquid rate."
+            )
+            return
+
+        # Candidate labels: esp_model (display) + BEP, obsolete flagged. Value = pump_id (key).
+        def _label(c: Dict[str, Any]) -> str:
+            bep = f"{c['bep_bpd']:.0f} bpd" if c.get("bep_bpd") is not None else "BEP —"
+            tag = "  ⚠ obsolete" if c.get("is_obsolete") else ""
+            return f"{c['esp_model']} · {c['manufacturer']}/{c['series']} · {bep}{tag}"
+
+        labels = ["— No pump selected —"] + [_label(c) for c in candidates]
+        pump_ids = [None] + [c["pump_id"] for c in candidates]
+        # Preserve a prior pick across reruns.
+        current_pid = (record.get("pump") or {}).get("pump_id")
+        default_idx = pump_ids.index(current_pid) if current_pid in pump_ids else 0
+        choice_idx = st.selectbox(
+            "Installed pump (manual pick)",
+            range(len(labels)),
+            index=default_idx,
+            format_func=lambda i: labels[i],
+            key=f"pump_pick_{record['well_id']}",
+        )
+
+        picked_pid = pump_ids[choice_idx]
+        if picked_pid is None:
+            ideal_catalog.set_pump_on_session(record, None)
+            st.info("No pump picked — connection unresolved (curve_position would block).")
+            return
+
+        # Build the canonical pick from the re-read catalog (single source of pick shape).
+        pick = ideal_catalog.make_pump_pick(
+            _load_ideal_catalog(), picked_pid,
+            bep_tolerance=report.get("bep_tolerance"),
+        )
+        ideal_catalog.set_pump_on_session(record, pick)
+        obs = " ⚠ **obsolete** (operator-confirmed)" if pick.get("is_obsolete") else ""
+        st.markdown(
+            f"Connected pump: **{pick['esp_model']}** "
+            f"(`pump_id={pick['pump_id']}`, {pick['manufacturer']}/{pick['series']}) · "
+            f"BEP {pick['bep_bpd']:.0f} bpd · trust would be **Estimated (catalog)**{obs}"
+        )
+
+
 # --- page ---------------------------------------------------------------------
 
 
@@ -586,7 +689,14 @@ def render_page() -> None:
                             # recommendation-absence block when no rec exists).
                             **{t: probe["recommendation"][t]["gate"] for t in _REC_TOOLS},
                             "recommendation_present": probe.get("recommendation_present"),
+                            # M4 / 4a: the pump-connection coverage report (candidate
+                            # list); the operator's pick is stored separately on the
+                            # record's `pump` field via set_pump_on_session.
+                            "connection": probe.get("connection"),
                         },
+                        # No pump picked yet — an honest "no connection" state (4b's
+                        # curve_position blocks on it). The pick UI below sets it.
+                        pump=None,
                     )
                 )
                 st.session_state["active_session_id"] = session_id
@@ -625,10 +735,27 @@ def render_page() -> None:
                 f"**{tool_name}** → `{tool_gate.get('status')}`"
                 + (f" · flags: {tool_gate.get('flags')}" if tool_gate.get("flags") else "")
             )
+        # M4 / 4a: the connection (curve_position) row — driven by the candidate count,
+        # not a gate. Reflects whether a pump *can* be connected for this well.
+        connection = availability.get("connection") or {}
+        conn_report = connection.get("report") or {}
+        n_cand = conn_report.get("n_candidates", 0) if not connection.get("error") else 0
+        cols = st.columns([1, 3])
+        cols[0].markdown(_trust_badge("Estimated"), unsafe_allow_html=True)
+        if connection.get("error"):
+            conn_msg = f"`blocked` · catalog unavailable: {connection['error']}"
+        elif n_cand:
+            conn_msg = f"`manual pick` · {n_cand} BEP-narrowed candidate(s) — pick below"
+        else:
+            conn_msg = "`blocked` · no candidate pump for this well's total fluid"
+        cols[1].markdown(f"**pump_connection** → {conn_msg}")
         if coverage.get("min_day") and coverage.get("max_day"):
             st.caption(
                 f"Data available: {coverage['min_day']} → {coverage['max_day']}"
             )
+
+    # --- pump connection: manual pick (M4 / 4a) -------------------------------
+    _render_pump_pick(record, availability)
 
     # --- editable ΔP physics inputs (depth + SG overrides) --------------------
     _render_delta_p_input_overrides(record, availability)

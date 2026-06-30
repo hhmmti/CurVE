@@ -27,12 +27,27 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 
+from curve import ideal_catalog
 from curve.engine import run_curve_turn
 from curve.session import new_session_record, save_session
 from curve.test_questions import TEST_QUESTIONS
+from curve.tools import probe_connection_coverage
 from curve.wrapper import CURVE_DEFAULT_PROFILE, CURVE_REGION
+
+# M4 / 4a demo wells for the connection-coverage check. The build-plan names the three
+# wells in `permian_resources`; we default to that org per the task spec, but the local
+# well_configuration_v2 snapshot (intership-experience/18) maps two of them to OTHER
+# orgs — HACKBERRY SPRINGS 3BH → `usedc`, ANNIE OAKLEY 4231A 1L → `civitas`, only
+# CHEDDAR FED COM 502H → `permian_resources`. FLAGGED, not reconciled (guardrail 11):
+# if a well returns no data live, re-run that one with `--org <real_org> --well "<name>"`.
+DEMO_WELLS = [
+    {"organization_id": "permian_resources", "well_id": "HACKBERRY SPRINGS 3BH"},
+    {"organization_id": "permian_resources", "well_id": "ANNIE OAKLEY 4231A 1L"},
+    {"organization_id": "permian_resources", "well_id": "CHEDDAR FED COM 502H"},
+]
 
 # --- ESTIMATED cost rates -----------------------------------------------------
 # EDIT HERE to update pricing. These are ESTIMATES (USD per 1M tokens) for the
@@ -176,6 +191,67 @@ def _run_session_ask(
     return 0
 
 
+def _run_coverage_check(
+    wells: list,
+    profile_name: str,
+    region_name: str,
+    bep_tolerance: float,
+) -> int:
+    """M4 / 4a: per-well pump-connection coverage check (the de-risking report).
+
+    For each demo well: fetch the catalog (re-read), compute total fluid, BEP-narrow,
+    and print total fluid + candidate count + the candidate list. Exercises the
+    connection-resolution layer end-to-end with NO ``curve_position`` tool present.
+    """
+    if profile_name:
+        os.environ.setdefault("AWS_PROFILE", profile_name)
+
+    print("CurVE M4/4a — pump-connection coverage check")
+    print(f"profile={profile_name}  region={region_name}  bep_tolerance=±{bep_tolerance*100:.0f}%\n")
+    print("Resolved catalog: "
+          f"{ideal_catalog.IDEAL_CATALOG_CATALOG}.{ideal_catalog.IDEAL_CATALOG_DATABASE}."
+          f"{ideal_catalog.IDEAL_CATALOG_TABLE}")
+    print("BEP filter (ported from app narrow_catalog): "
+          "min_recommended_bpd <= rate <= max_recommended_bpd  AND  "
+          "bep_bpd*(1-tol) <= rate <= bep_bpd*(1+tol)\n")
+
+    try:
+        catalog_df = ideal_catalog.fetch_ideal_catalog(profile_name=profile_name, region_name=region_name)
+    except Exception as exc:
+        print(f"Catalog fetch FAILED: {exc}")
+        return 1
+    print(f"Catalog rows fetched (obsolete KEPT, not dropped): {len(catalog_df)}\n")
+
+    resolved_inputs_ctx = {"bep_tolerance": bep_tolerance}
+    for well in wells:
+        org, wid = well["organization_id"], well["well_id"]
+        print(f"=== {wid}  (org {org}) ===")
+        try:
+            probe = probe_connection_coverage(
+                org, wid, catalog_df, resolved_inputs_ctx=resolved_inputs_ctx
+            )
+        except Exception as exc:
+            print(f"  coverage probe FAILED: {exc}\n")
+            continue
+        report = probe["report"]
+        tf = report["total_fluid_bpd"]
+        print(f"  total fluid (median liquid rate): {tf:.0f} bpd" if tf is not None
+              else "  total fluid: — (telemetry absent → no candidates)")
+        print(f"  BEP-compatible rows: {report['n_bep_compatible']}  "
+              f"| selectable candidates: {report['n_candidates']}  "
+              f"| excluded (missing coeffs): {report['n_excluded_missing_coeffs']}  "
+              f"| obsolete surfaced: {report['n_obsolete_surfaced']}")
+        for c in report["candidates"]:
+            obs = "  ⚠ obsolete" if c["is_obsolete"] else ""
+            bep = f"{c['bep_bpd']:.0f}" if c["bep_bpd"] is not None else "—"
+            print(f"    • {c['esp_model']}  (pump_id={c['pump_id']}, {c['manufacturer']}/{c['series']}) "
+                  f"BEP {bep} bpd{obs}")
+        if not report["candidates"]:
+            print("    (no selectable candidates — operator picks nothing; downstream blocks honestly)")
+        print()
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="CurVE tool-loop CLI.")
     parser.add_argument(
@@ -203,9 +279,29 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--html-out", help="Optional path to write the produced Plotly figure as HTML."
     )
+    # M4 / 4a connection-coverage check.
+    parser.add_argument(
+        "--coverage-check",
+        action="store_true",
+        help="Run the M4/4a pump-connection coverage check over the demo wells.",
+    )
+    parser.add_argument(
+        "--bep-tolerance",
+        type=float,
+        default=ideal_catalog.DEFAULT_BEP_TOLERANCE,
+        help=f"BEP tolerance fraction for narrowing (default {ideal_catalog.DEFAULT_BEP_TOLERANCE}).",
+    )
     args = parser.parse_args(argv)
 
     enable_thinking = not args.no_thinking
+    if args.coverage_check:
+        # --org/--well (when both given) override the demo list with a single well.
+        wells = (
+            [{"organization_id": args.org, "well_id": args.well}]
+            if (args.org and args.well)
+            else DEMO_WELLS
+        )
+        return _run_coverage_check(wells, args.profile, args.region, args.bep_tolerance)
     if args.ask or args.org or args.well:
         if not (args.org and args.well and args.ask):
             parser.error("--ask mode requires all of --org, --well, and --ask.")
