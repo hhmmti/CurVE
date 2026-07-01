@@ -32,11 +32,15 @@ from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
 
-from compute import ml_recommendation_calcs
+from compute import ideal_curve_overlay, ml_recommendation_calcs
 from compute.affinity_validator import compute_affinity_law_validator
 from compute.energy_efficiency import compute_energy_efficiency_diagnostic
 from compute.preprocessed_calcs import WELL_DEPTH_FT
 from plotting.affinity_charts import build_affinity_law_panel
+from plotting.curve_position_charts import (
+    build_curve_position_family,
+    build_curve_position_overlay,
+)
 from plotting.energy_charts import build_energy_power_cards
 from plotting.preprocessed_charts import (
     build_allocation_temporal,
@@ -46,12 +50,20 @@ from plotting.preprocessed_charts import (
 )
 from plotting.recommendation_compare_charts import build_recommendation_comparison_bars
 
-from . import data, delta_p_inputs, ideal_catalog, recommendations, well_depth
+from . import (
+    curve_position as curve_position_layer,
+    data,
+    delta_p_inputs,
+    ideal_catalog,
+    recommendations,
+    well_depth,
+)
 from ._vendored import preprocessed_pipeline_service
 from .envelope import error_envelope, success_envelope
 from .gate import (
     recommendation_absence_block,
     run_affinity_check_gate,
+    run_curve_position_gate,
     run_delta_p_tool_gate,
     run_energy_efficiency_gate,
     run_recommendation_comparison_gate,
@@ -63,8 +75,10 @@ prepare_daily_data = preprocessed_pipeline_service.prepare_daily_data
 run_preprocessed_analysis = preprocessed_pipeline_service.run_preprocessed_analysis
 
 # Keys the engine strips from a tool result before it reaches the model. The Plotly
-# figure and its UI ref never go back to the model (CurVE-decisions §3 D2).
-NON_MODEL_RESULT_KEYS = {"figure", "figure_ref"}
+# figure(s) and the UI ref never go back to the model (CurVE-decisions §3 D2). ``figures``
+# (plural) is curve_position's multi-figure slot — stripped exactly like the singular
+# ``figure`` so the model-facing envelope stays values + trust_label only.
+NON_MODEL_RESULT_KEYS = {"figure", "figure_ref", "figures"}
 
 
 # --- real tool: production_history --------------------------------------------
@@ -1137,11 +1151,140 @@ def probe_connection_coverage(
     }
 
 
-# --- M1 stub tools (still mock; real in M4) ------------------------------------
+# --- real tool: curve_position (M4 / 4b) --------------------------------------
+# The headline M4 tool — "where am I on the pump curve, and how far off design am I."
+# FIRST tool that is BOTH connection-dependent (the 4a manual pump pick → the picked
+# pump's ideal curve) AND ΔP-input-dependent (the operating point's head from the M3
+# delta_p_inputs layer). Trust = Estimated(catalog model) ⊓ ΔP-tier, weakest-wins. The
+# pump pick rides the SETUP-INJECTION path (session['pump'] → tool_input['pump']); the
+# stage count + operating Hz ride resolved_inputs — neither is a model-facing arg.
 
 
 def curve_position(tool_input: Dict[str, Any]) -> Dict[str, Any]:
-    return {"mock": "curve_position output", "received_input": tool_input}
+    """Real ``curve_position``: pick → curve reconstruct → operating point → position → envelope.
+
+    Two hard blocks read off the injected pick state (NOT re-derived): no pump picked →
+    blocked ``pump_connection_unresolved`` ("connect a pump"); picked pump's row has
+    null/incomplete curve coeffs → blocked ``pump_curve_coeffs_absent`` ("no ideal curve
+    for this pump"). A missing operating point from the ΔP layer (zero PIP coverage) is
+    the inherited not-ready, not a new block. Obsolete is a FLAG, never a block/downgrade.
+    """
+    organization_id = tool_input.get("organization_id")
+    well_id = tool_input.get("well_id")
+    pump = tool_input.get("pump")
+    resolved_inputs_ctx = tool_input.get("resolved_inputs")
+
+    if not organization_id or not well_id:
+        return error_envelope("blocked", ["missing_org_or_well_injection"])
+
+    # Hard block 1 — connection unresolved (no pump picked). Not proxyable: a pump pick
+    # is the v1 connection ladder's manual rung; absence is honest, never a default pump.
+    if not pump or not pump.get("pump_id"):
+        return error_envelope(
+            "blocked", ["pump_connection_unresolved: connect a pump"], well_id=well_id
+        )
+    # Hard block 2 — picked pump has null/incomplete curve coeffs (coverage gap). The
+    # 4a pick already resolved selectability; we READ it, not re-derive selectable_mask.
+    if not pump.get("selectable"):
+        return error_envelope(
+            "blocked",
+            ["pump_curve_coeffs_absent: no ideal curve for this pump"],
+            well_id=well_id,
+        )
+
+    # Stage count + operating Hz — setup-injected manual inputs (NOT well_configuration).
+    scaling = curve_position_layer.resolve_scaling_inputs(resolved_inputs_ctx)
+    if not scaling.ready:
+        return error_envelope("blocked", scaling.flags, well_id=well_id)
+
+    try:
+        # Re-read the catalog (per-session) and pull the picked pump's full coeff row.
+        catalog = ideal_catalog.fetch_ideal_catalog()
+        pump_row = curve_position_layer.lookup_pump_row(catalog, pump["pump_id"])
+        if pump_row is None:
+            return error_envelope(
+                "blocked", ["picked_pump_not_in_catalog"], well_id=well_id
+            )
+
+        # Telemetry + production via the SAME data path the ΔP tools use.
+        telemetry_df, production_df = data.fetch_preprocessed_window(
+            organization_id, well_id
+        )
+        if telemetry_df is None or len(telemetry_df) == 0 or production_df is None or len(production_df) == 0:
+            return error_envelope("blocked", ["telemetry_or_production_absent"], well_id=well_id)
+
+        # Resolve depth/SG (real rrc → override → default) for the ΔP compute, then run
+        # the vendored preprocessed analysis (writes delta_p_pump_psi + liquid_rate).
+        rrc_depth_ft = well_depth.fetch_well_depth_ft(well_id)
+        resolved = delta_p_inputs.resolve_from_context(resolved_inputs_ctx, rrc_depth_ft)
+        analyzed, _meta = run_preprocessed_analysis(
+            telemetry_df,
+            production_df,
+            well_depth_ft=resolved.depth_ft,
+            sg_oil=resolved.sg_oil,
+            sg_water=resolved.sg_water,
+        )
+
+        # PIP coverage (measured-or-missing) + operating point (flow = 4a total fluid;
+        # ΔP = median over PIP-present rows; head via the mixture SG).
+        coverage = delta_p_inputs.pip_coverage(analyzed)
+        present = delta_p_inputs.pip_present_rows(analyzed, coverage)
+        operating_flow = ideal_catalog.resolve_total_fluid_bpd(analyzed)
+        sg_for_dp = curve_position_layer.representative_sg(present)
+        operating_point = curve_position_layer.build_operating_point(
+            analyzed, operating_flow, present, sg_for_dp
+        )
+
+        # Gate: inherited ΔP not-ready (zero PIP / no op point) else Estimated ⊓ ΔP-tier,
+        # with the obsolete flag carried (never a block/downgrade).
+        gate = run_curve_position_gate(
+            resolved, coverage, operating_point, obsolete=bool(pump.get("is_obsolete"))
+        )
+        if gate["status"] != "available":
+            return error_envelope(gate["status"], gate["flags"], well_id=well_id)
+
+        # Reconstruct the well-scaled curve + the affinity family + the position values.
+        curve_df, family_curves, position = curve_position_layer.evaluate_position(
+            pump_row, pump, scaling, operating_point, sg_for_dp
+        )
+        daily = prepare_daily_data(present)
+        if "amp_x_volt" in daily.columns:
+            observed = ideal_curve_overlay.compute_observed_proxies(daily)
+        else:  # no electrical channel for the efficiency proxy — figures still draw ΔP.
+            observed = daily.copy()
+            observed["eff_real_proxy_ratio"] = float("nan")
+        _label = (
+            f"{well_id} | {pump.get('esp_model')} | "
+            f"{scaling.frequency_hz:.1f} Hz | {scaling.stages} stages"
+        )
+        # TWO figures, ordered: single-frequency overlay first, then the affinity family
+        # sweep — both mark the same operating point. UI only; stripped from the model.
+        figures = [
+            build_curve_position_overlay(
+                observed, curve_df, operating_point,
+                title=f"Operating Point vs Ideal Curve — {_label}",
+            ),
+            build_curve_position_family(
+                observed, family_curves, operating_point,
+                selected_frequency_hz=scaling.frequency_hz,
+                title=f"Frequency Family (affinity sweep) — {_label}",
+            ),
+        ]
+        values = {"well_id": well_id, **position, "inputs": resolved.as_values()}
+    except Exception as exc:  # data/compute failure → structured envelope, not an exception
+        return error_envelope("error", [f"data_or_compute_error: {exc}"], well_id=well_id)
+
+    # curve_position carries a FIGURES LIST (overlay, family) rather than the singular
+    # figure/figure_ref slot. ``figures`` is out-of-band + stripped from the model exactly
+    # as ``figure`` is (see NON_MODEL_RESULT_KEYS); the model-facing envelope stays
+    # {status, values, trust_label, flags}.
+    return {
+        "status": "available",
+        "values": values,
+        "trust_label": gate["trust_label"],  # Estimated ⊓ ΔP-tier (weakest-wins) — from gate
+        "flags": gate["flags"],
+        "figures": figures,  # → UI only; the engine strips this before the model sees it
+    }
 
 
 # --- real tool specs (Converse toolConfig shape) ------------------------------
@@ -1331,27 +1474,18 @@ _CURVE_POSITION_SPEC = {
     "toolSpec": {
         "name": "curve_position",
         "description": (
-            "Determine where the pump is operating on its performance curve right "
-            "now — the ideal-curve overlay (single + multi-frequency, ΔP) plus the "
-            "BEP position. Use for 'where am I on the curve', 'am I near best "
-            "efficiency point', or operating-point-vs-pump-curve questions. "
-            "(In production this needs a resolved pump connection; mocked in M1.)"
+            "Determine where the selected well's pump is operating on its ideal "
+            "performance curve right now, and how far off design it is — the operating "
+            "point (flow + pump ΔP) overlaid on the well-scaled ideal curve, the "
+            "variance from the ideal head at that flow, and the position relative to "
+            "the best-efficiency point (BEP) and the recommended operating window. Use "
+            "for 'where am I on the pump curve', 'am I near BEP', 'how far off design "
+            "is this pump', or operating-point-vs-pump-curve questions. The well, the "
+            "installed pump, and its stage count / operating frequency are already set "
+            "up for this session — no arguments are needed."
         ),
         "inputSchema": {
-            "json": {
-                "type": "object",
-                "properties": {
-                    "well_id": {
-                        "type": "string",
-                        "description": "Identifier of the well.",
-                    },
-                    "frequency_hz": {
-                        "type": "number",
-                        "description": "Operating frequency to evaluate, optional.",
-                    },
-                },
-                "required": ["well_id"],
-            }
+            "json": {"type": "object", "properties": {}, "required": []}
         },
     }
 }

@@ -315,6 +315,57 @@ def recommendation_absence_block() -> Dict[str, Any]:
     }
 
 
+# --- curve_position: connection ⊓ ΔP, weakest-wins (M4 / 4b) -------------------
+# The headline M4 tool's gate. It is the FIRST tool that folds a CONNECTION-tier label
+# (the ideal catalog MODEL) with the ΔP-tier (depth/SG via the resolution layer). The
+# catalog curve is a manufacturer MODEL, never field-validated against this well, so its
+# tier is always **Estimated** — it can never lift the tool to Validated. The overall
+# label is weakest-wins of {Estimated(catalog), ΔP-tier}: Estimated ⊓ Validated =
+# Estimated, Estimated ⊓ Estimated = Estimated. We never present an estimated overlay as
+# validated. Obsolete is a FLAG, never a block or a trust downgrade (guardrail 3).
+
+# The catalog curve's fixed connection tier — an ideal manufacturer model, not measured.
+_CURVE_MODEL_TERM = "Estimated"
+
+
+def run_curve_position_gate(
+    resolved_inputs: Any,
+    coverage: Dict[str, Any],
+    operating_point: Optional[Dict[str, Any]],
+    *,
+    obsolete: bool = False,
+) -> Dict[str, Any]:
+    """Gate ``curve_position`` — inherited ΔP not-ready, else Estimated ⊓ ΔP-tier.
+
+    The two connection HARD BLOCKS (no pump picked; picked pump has null curve coeffs)
+    are decided by the tool off the injected pick state BEFORE this runs — they are not
+    re-derived here. This gate handles the ΔP-dependent readiness + the trust fold:
+
+      * zero PIP coverage → blocked ``pip_coverage_zero`` (the INHERITED ΔP not-ready;
+        ΔP can't be formed, so there is no operating point — not a new connection block).
+      * no operating point (flow or ΔP absent) → blocked ``operating_point_absent``.
+      * otherwise available, ``weakest_trust([Estimated(catalog), ΔP-tier])`` — carrying
+        the depth/SG source flags, a partial-PIP-coverage flag, the catalog-model flag,
+        and (when set) the obsolete flag. Obsolete does NOT downgrade or block.
+    """
+    if coverage.get("zero", True):
+        # Inherited from the ΔP layer: PIP is measured-or-missing, never proxied.
+        return {"status": "blocked", "trust_label": None, "flags": ["pip_coverage_zero"]}
+    if operating_point is None:
+        return {"status": "blocked", "trust_label": None, "flags": ["operating_point_absent"]}
+
+    trust = weakest_trust([_CURVE_MODEL_TERM, getattr(resolved_inputs, "trust_label", None)])
+    flags: List[str] = list(getattr(resolved_inputs, "flags", []))
+    flags.append("curve_from_catalog_model_estimated")
+    if coverage.get("partial"):
+        flags.append(
+            f"pip_coverage_partial: {coverage['n_present']}/{coverage['n_total']} rows"
+        )
+    if obsolete:
+        flags.append("picked_pump_obsolete")
+    return {"status": "available", "trust_label": trust, "flags": flags}
+
+
 def run_recommendation_comparison_gate(compare_row: Dict[str, Any]) -> Dict[str, Any]:
     """Gate ``recommendation_comparison`` — faithful extraction, Validated-rel-payload.
 

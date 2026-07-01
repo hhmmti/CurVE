@@ -12,7 +12,7 @@ import json
 
 import pandas as pd
 
-from curve import data, recommendations, session, well_depth
+from curve import data, ideal_catalog, recommendations, session, well_depth
 from curve.engine import run_curve_turn
 
 ORG, WELL = "org-demo", "W-12"
@@ -54,15 +54,31 @@ def _production():
     })
 
 
+def _ideal_catalog() -> pd.DataFrame:
+    """One BEP-compatible (median liquid = 400 bpd) selectable ChampionX pump."""
+    row = {
+        "pump_id": "CX-DEMO", "esp_model": "P6-400", "manufacturer": "ChampionX",
+        "series": "400", "bep_bpd": 400.0, "min_recommended_bpd": 250.0,
+        "max_recommended_bpd": 600.0, "max_plotted_bpd": 800.0, "is_obsolete": "false",
+    }
+    row.update({"ideal_head_c1": 60.0, "ideal_head_c2": -0.04, "ideal_head_c3": 0.0,
+                "ideal_head_c4": 0.0, "ideal_head_c5": 0.0, "ideal_head_c6": 0.0})
+    row.update({f"ideal_power_c{i}": (10.0 if i == 1 else 0.0) for i in range(1, 7)})
+    return pd.DataFrame([row])
+
+
 def _isolate_data(rec_present: bool):
     data.fetch_preprocessed_window = lambda *a, **k: (_telemetry(), _production())
     well_depth.fetch_well_depth_ft = lambda *a, **k: 9100.0
     recommendations.fetch_latest_recommendation = lambda *a, **k: (_rec_row() if rec_present else None)
+    ideal_catalog.fetch_ideal_catalog = lambda *a, **k: _ideal_catalog()
 
 
-def _run(label, question, rec_present):
+def _run(label, question, rec_present, pump=None, resolved_inputs=None):
     _isolate_data(rec_present)
-    rec = session.new_session_record("sess", ORG, WELL, resolved_inputs={})
+    rec = session.new_session_record(
+        "sess", ORG, WELL, resolved_inputs=resolved_inputs or {}, pump=pump
+    )
     result = run_curve_turn(question, session=rec, profile_name="roam-ai")
     print(f"\n=== {label} ===")
     print(f"Q: {question}")
@@ -98,3 +114,15 @@ if __name__ == "__main__":
         "Does the recommended frequency change obey the pump affinity laws?",
     ):
         _run("adjacent-physics", q, rec_present=True)
+
+    # 4) M4 (4b) — pump-curve / variance-from-design questions must route to
+    #    curve_position. A pump is picked + stage count / Hz injected on the session, so
+    #    the tool runs end-to-end and returns an Estimated overlay (catalog ⊓ ΔP-tier).
+    _pump = ideal_catalog.make_pump_pick(_ideal_catalog(), "CX-DEMO", bep_tolerance=0.25)
+    _scaling = {"stages": 175, "operating_frequency_hz": 58.0}
+    for q in (
+        "Where is this well operating on its pump curve right now?",
+        "How far off design is this pump — what's the variance from the ideal curve?",
+        "Is the pump running near its best efficiency point?",
+    ):
+        _run("M4 curve_position", q, rec_present=True, pump=_pump, resolved_inputs=_scaling)

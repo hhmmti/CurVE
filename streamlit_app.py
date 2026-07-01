@@ -31,6 +31,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
 import streamlit as st
 
 from cli import _estimate_cost_usd  # reuse the M1 cost estimator (no logic copied)
@@ -182,6 +183,16 @@ def _availability_probe(organization_id: str, well_id: str) -> Dict[str, Any]:
         )
     except Exception as exc:  # catalog read / schema mismatch — surface, don't crash setup
         connection = {"report": None, "error": str(exc), "n_candidates": 0}
+    # M4 / 4b: representative telemetry motor frequency — the Hz the pump is actually
+    # running at. Seeds (only) the curve_position operating-frequency field in the
+    # pump-pick step; the operator can override it. NOT line frequency, NOT a default
+    # stage count — a physically-real reading, surfaced for the operator to accept/edit.
+    _freq = (
+        pd.to_numeric(telemetry_df.get("motor_frequency_hz"), errors="coerce").dropna()
+        if telemetry_df is not None
+        else pd.Series(dtype=float)
+    )
+    telemetry_hz = float(_freq.median()) if not _freq.empty else None
     return {
         "gate": run_tool_gate("production_history", telemetry_df, production_df),
         # Second connection-free Validated tool — same data, same gate keys.
@@ -192,6 +203,8 @@ def _availability_probe(organization_id: str, well_id: str) -> Dict[str, Any]:
         "recommendation": rec_gates,
         "recommendation_present": recommendations.has_recommendation(latest_rec),
         "connection": connection,
+        # Seed for the curve_position operating-frequency field (pump-pick step).
+        "telemetry_motor_frequency_hz": telemetry_hz,
     }
 
 
@@ -400,9 +413,19 @@ def _render_tool_envelope(name: str, envelope: Dict[str, Any]) -> None:
         kpi_renderer = _TOOL_KPI_RENDERERS.get(name)
         if kpi_renderer is not None:
             kpi_renderer(envelope.get("values"))
-        figure = envelope.get("figure")
-        if figure is not None:
-            st.plotly_chart(figure, use_container_width=True)
+        # Render every figure the tool carries, in order. curve_position carries a
+        # ``figures`` list (single-freq overlay, then affinity family); the other tools
+        # carry a singular ``figure``. Support both — a blocked/not-ready tool has
+        # neither, so nothing (no placeholder) renders for it.
+        figures = envelope.get("figures")
+        if figures:
+            for figure in figures:
+                if figure is not None:
+                    st.plotly_chart(figure, use_container_width=True)
+        else:
+            figure = envelope.get("figure")
+            if figure is not None:
+                st.plotly_chart(figure, use_container_width=True)
     else:
         st.warning(
             f"`{name}` is **{status}** — "
@@ -412,11 +435,17 @@ def _render_tool_envelope(name: str, envelope: Dict[str, Any]) -> None:
 
 def _render_answer(entry: Dict[str, Any], dev_mode: bool) -> None:
     """Render one assistant turn: per-tool badge + KPI + figure + narration (+ dev panel)."""
-    # Render each physics tool the loop called (usually one — single-tool answer shape).
+    # Render each physics tool the loop called, IN TOOL-TRACE ORDER (tool_outputs is
+    # appended by the engine in call order). Every tool with an envelope is rendered —
+    # NOT only those in _TOOL_KPI_RENDERERS: curve_position carries a figure but no KPI
+    # block, and gating on the KPI map silently dropped its overlay. _render_tool_envelope
+    # renders the KPI only when a renderer exists, always renders an available tool's
+    # figure, and draws no chart/placeholder for a blocked/not-ready tool (its status is
+    # surfaced as text + in the narration).
     for output in entry.get("tool_outputs") or []:
         name = output.get("name")
         envelope = output.get("result")
-        if name in _TOOL_KPI_RENDERERS and isinstance(envelope, dict):
+        if isinstance(envelope, dict):
             _render_tool_envelope(name, envelope)
 
     # The one synthesizing narration paragraph (answer-level).
@@ -522,7 +551,15 @@ def _render_delta_p_input_overrides(
             overrides["sg_water_override"] = sg_water_val
 
         # Persist onto the session so the engine injects it into each ΔP tool call.
-        record["resolved_inputs"] = overrides
+        # This handler OWNS only the depth/SG override keys — rebuild that slice (so a
+        # revert-to-prefill clears the override) while PRESERVING keys owned by other
+        # setup steps (the pump-pick step's `stages` / `operating_frequency_hz`, which
+        # curve_position reads). A blanket overwrite here would wipe them.
+        resolved = dict(record.get("resolved_inputs") or {})
+        for _k in ("depth_override", "sg_oil_override", "sg_water_override"):
+            resolved.pop(_k, None)
+        resolved.update(overrides)
+        record["resolved_inputs"] = resolved
         session.save_session(record)
 
         # Show the provenance the next ΔP answer will carry.
@@ -615,6 +652,79 @@ def _render_pump_pick(record: Dict[str, Any], availability: Dict[str, Any]) -> N
             f"BEP {pick['bep_bpd']:.0f} bpd · trust would be **Estimated (catalog)**{obs}"
         )
 
+        # --- curve_position scaling inputs (M4 / 4b) --------------------------
+        # Co-located with the pick: the pump's identity + its stage count + its
+        # operating frequency are one physical act. Both ride ``resolved_inputs``
+        # under the CANONICAL keys curve_position reads — ``stages`` and
+        # ``operating_frequency_hz`` (NOT the ``frequency_hz`` alias, NOT
+        # ``session['pump']``, NOT a model argument) — the same setup-injection path
+        # as depth/SG. Guardrail 4: stages (section count) ≠ operating frequency
+        # (the pump's running Hz, seeded from telemetry — not line frequency).
+        st.markdown("**Curve scaling** — stage count & operating frequency (feeds `curve_position`)")
+        sc1, sc2 = st.columns(2)
+        # stages: NO default — blank until entered. A pre-filled stage count is the
+        # fabrication the block exists to prevent (it silently corrupts curve scaling),
+        # so absent must stay reachable → the honest ``stages_absent`` block.
+        stages_val = sc1.number_input(
+            "Pump stages",
+            min_value=1,
+            value=None,
+            step=1,
+            format="%d",
+            placeholder="enter stage count",
+            key=f"pump_stages_{record['well_id']}",
+            help="Number of pump stages/sections — no honest default; the per-stage "
+            "curve can't be scaled to the well without it. Distinct from the running Hz.",
+        )
+        # operating_frequency_hz: seeded from the telemetry frequency the pump is
+        # actually running at (the physically-correct scaling target), overridable.
+        hz_seed = availability.get("telemetry_motor_frequency_hz")
+        hz_val = sc2.number_input(
+            "Operating frequency (Hz)",
+            min_value=0.0,
+            value=float(hz_seed) if hz_seed else None,
+            step=0.5,
+            placeholder="enter operating Hz",
+            key=f"pump_opfreq_{record['well_id']}",
+            help="The Hz the pump is running at (seeded from telemetry "
+            "motor_frequency_hz) — the ideal curve is scaled to this. Not line frequency.",
+        )
+
+        # Persist the two CANONICAL keys, preserving keys owned by other setup steps
+        # (depth/SG overrides). Blank stages → drop the key so ``stages_absent`` fires.
+        resolved = dict(record.get("resolved_inputs") or {})
+        if stages_val is not None and int(stages_val) >= 1:
+            resolved["stages"] = int(stages_val)
+        else:
+            resolved.pop("stages", None)
+        if hz_val is not None and float(hz_val) > 0:
+            resolved["operating_frequency_hz"] = float(hz_val)
+        else:
+            resolved.pop("operating_frequency_hz", None)
+        record["resolved_inputs"] = resolved
+        session.save_session(record)
+
+        # Validation — WARN only (a real reading may sit near the edge); never hard-block.
+        if stages_val is None:
+            st.warning(
+                "Enter the pump stage count — `curve_position` blocks "
+                "(`stages_absent`) until it's set."
+            )
+        if hz_val is not None and not (40.0 <= float(hz_val) <= 80.0):
+            st.warning(
+                f"Operating frequency {float(hz_val):.1f} Hz is outside the typical ESP "
+                "range (~40–80 Hz) — double-check the value (not hard-blocked)."
+            )
+        _seed_note = f" · seeded from telemetry **{hz_seed:.1f} Hz**" if hz_seed else ""
+        st.caption(
+            "`curve_position` will scale the ideal curve to "
+            + (f"**{int(stages_val)} stages**" if stages_val is not None else "**— stages**")
+            + " at "
+            + (f"**{float(hz_val):.1f} Hz**" if hz_val is not None else "**— Hz**")
+            + _seed_note
+            + f" · keys → `resolved_inputs['stages']`, `resolved_inputs['operating_frequency_hz']`"
+        )
+
 
 # --- page ---------------------------------------------------------------------
 
@@ -693,6 +803,10 @@ def render_page() -> None:
                             # list); the operator's pick is stored separately on the
                             # record's `pump` field via set_pump_on_session.
                             "connection": probe.get("connection"),
+                            # M4 / 4b: seed for the operating-frequency field (pump-pick).
+                            "telemetry_motor_frequency_hz": probe.get(
+                                "telemetry_motor_frequency_hz"
+                            ),
                         },
                         # No pump picked yet — an honest "no connection" state (4b's
                         # curve_position blocks on it). The pick UI below sets it.

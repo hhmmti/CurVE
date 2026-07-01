@@ -131,7 +131,12 @@ def test_tool_result_appended_between_turns():
     assert tool_result_msg["role"] == "user"
     block = tool_result_msg["content"][0]["toolResult"]
     assert block["toolUseId"] == "tu-1"
-    assert block["content"][0]["json"]["mock"] == "curve_position output"
+    # curve_position is real (M4): with no session, org/well aren't injected, so it
+    # returns the shared blocked envelope. What this test asserts is the loop plumbing —
+    # the tool result is appended, and the figure artifacts are stripped before the model.
+    model_facing = block["content"][0]["json"]
+    assert model_facing["status"] == "blocked"
+    assert "figure" not in model_facing and "figure_ref" not in model_facing
 
 
 def test_reasoning_content_preserved_verbatim():
