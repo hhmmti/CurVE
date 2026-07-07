@@ -26,6 +26,7 @@ from curve.envelope import ENVELOPE_KEYS  # noqa: E402
 from curve.gate import _apply_field_aliases, run_tool_gate  # noqa: E402
 from curve.tools import (  # noqa: E402
     TOOL_REGISTRY,
+    _project_wcg_values,
     production_history,
     water_cut_gor_history,
 )
@@ -213,6 +214,94 @@ def test_schema_has_no_org_or_well():
 
 def test_bubble_point_screen_is_gone():
     assert "bubble_point_screen" not in TOOL_REGISTRY
+
+
+# --- projection: last-valid selection on null-allocation windows --------------
+# Same null-allocation gap as production_history, but the water-cut/GOR story: either
+# boundary may be the null one, and the fluid-character cards + direction must reflect
+# the real data, never a false "flat". These drive _project_wcg_values directly.
+
+_GAP = {"oil": None, "water": None, "gas": None, "liquid": 0.0, "wc": None, "gor": None}
+
+
+def _day(oil, water, gas=450.0, wc=None, gor=None):
+    liquid = oil + water
+    return {
+        "oil": oil,
+        "water": water,
+        "gas": gas,
+        "liquid": liquid,
+        "wc": wc if wc is not None else round(water / liquid, 3),
+        "gor": gor if gor is not None else round(gas / oil, 3),
+    }
+
+
+def _daily_frame(rows, start="2026-01-01"):
+    days = pd.date_range(start, periods=len(rows), freq="D")
+    return pd.DataFrame(
+        {
+            "observation_day": days.strftime("%Y-%m-%d"),
+            "alloc_oil_vol": [r["oil"] for r in rows],
+            "alloc_water_vol": [r["water"] for r in rows],
+            "alloc_gas_vol": [r["gas"] for r in rows],
+            "liquid_rate_bbl_day": [r["liquid"] for r in rows],
+            "water_cut": [r["wc"] for r in rows],
+            "gor": [r["gor"] for r in rows],
+        }
+    )
+
+
+def test_wcg_first_null_trend_first_populates():
+    # MIPA NO SLEEP shape for the wcg tool: leading day null (oil/WC/GOR), latest full.
+    rows = [_GAP, _day(280.0, 130.0), _day(260.0, 150.0)]
+    v = _project_wcg_values("W", _daily_frame(rows), telemetry_rows=3)
+
+    assert v["trend"]["water_cut_first"] is not None  # skipped the leading null
+    assert v["trend"]["water_cut_change_pct"] is not None
+    assert v["trend"]["direction"] == "watering_up"  # water cut climbs
+    assert v["latest"]["water_cut"] is not None
+
+
+def test_wcg_tail_null_latest_from_last_valid_day():
+    rows = [_day(300.0, 120.0), _day(280.0, 140.0), _GAP]
+    v = _project_wcg_values("W", _daily_frame(rows), telemetry_rows=3)
+
+    assert v["latest"]["observation_day"] == "2026-01-02"
+    assert v["latest"]["water_cut"] is not None
+    assert v["latest"]["gor"] is not None
+    assert v["trend"]["water_cut_last"] is not None
+    assert v["trend"]["direction"] != "not_computable"  # honest, computed
+
+
+def test_wcg_all_null_is_not_computable_no_false_flat():
+    rows = [_GAP, _GAP, _GAP]
+    v = _project_wcg_values("W", _daily_frame(rows), telemetry_rows=3)
+
+    assert v["trend"]["direction"] == "not_computable"
+    assert v["trend"]["water_cut_change_pct"] is None
+    assert v["trend"]["gor_change_pct"] is None
+    assert v["latest"]["observation_day"] is None
+    assert v["latest"]["water_cut"] is None
+
+
+def test_wcg_single_valid_point_change_not_computable():
+    rows = [_GAP, _day(270.0, 130.0), _GAP]
+    v = _project_wcg_values("W", _daily_frame(rows), telemetry_rows=3)
+
+    assert v["trend"]["water_cut_change_pct"] is None
+    assert v["trend"]["gor_change_pct"] is None
+    assert v["trend"]["direction"] == "not_computable"
+    assert v["latest"]["water_cut"] is not None  # the one valid day fills the cards
+
+
+def test_wcg_clean_window_unchanged():
+    # Oil declines, water rises → water cut climbs → watering_up (no gaps).
+    rows = [_day(300.0 - i * 3, 100.0 + i * 8) for i in range(5)]
+    v = _project_wcg_values("W", _daily_frame(rows), telemetry_rows=5)
+
+    assert v["trend"]["direction"] == "watering_up"
+    assert v["trend"]["water_cut_change_pct"] > 0
+    assert v["latest"]["observation_day"] == "2026-01-05"
 
 
 # --- shared error envelope (M3 contract) --------------------------------------

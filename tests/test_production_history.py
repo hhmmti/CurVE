@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from curve import data, session  # noqa: E402
 from curve.engine import run_curve_turn  # noqa: E402
 from curve.gate import run_tool_gate  # noqa: E402
-from curve.tools import TOOL_REGISTRY, production_history  # noqa: E402
+from curve.tools import TOOL_REGISTRY, _project_values, production_history  # noqa: E402
 
 # Reuse the M1 scripted wrapper + response builders (same package, cred-free).
 from tests.test_loop import (  # noqa: E402
@@ -256,6 +256,101 @@ def test_setup_context_line_added_to_system(mock_fetch):
 
 
 # --- registry sanity (M2 schema change) ---------------------------------------
+
+
+# --- projection: last-valid selection on null-allocation windows --------------
+# Boundary rows can carry a null allocation (a day with no allocated production →
+# alloc_* null together, liquid_rate 0). The projection must reselect over the rows
+# that actually have data instead of falsely reading "flat" or blanking the cards.
+# These drive _project_values directly (the projection layer, no AWS, no pipeline).
+
+_GAP = {"oil": None, "water": None, "gas": None, "liquid": 0.0, "wc": None, "gor": None}
+
+
+def _day(oil, water=120.0, gas=450.0, liquid=None, wc=0.30, gor=1.5):
+    return {
+        "oil": oil,
+        "water": water,
+        "gas": gas,
+        "liquid": (oil + water) if liquid is None and oil is not None else liquid,
+        "wc": wc,
+        "gor": gor,
+    }
+
+
+def _daily_frame(rows, start="2026-01-01"):
+    """Build a projection-input daily frame from row dicts (None → a null cell)."""
+    days = pd.date_range(start, periods=len(rows), freq="D")
+    return pd.DataFrame(
+        {
+            "observation_day": days.strftime("%Y-%m-%d"),
+            "alloc_oil_vol": [r["oil"] for r in rows],
+            "alloc_water_vol": [r["water"] for r in rows],
+            "alloc_gas_vol": [r["gas"] for r in rows],
+            "liquid_rate_bbl_day": [r["liquid"] for r in rows],
+            "water_cut": [r["wc"] for r in rows],
+            "gor": [r["gor"] for r in rows],
+        }
+    )
+
+
+def test_projection_tail_null_populates_latest_from_last_valid_day():
+    # HACKBERRY SPRINGS 3BH shape: the final day has no allocation.
+    rows = [_day(300.0), _day(280.0), _GAP]
+    v = _project_values("W", _daily_frame(rows), telemetry_rows=3)
+
+    # latest reads the LAST VALID day (2026-01-02), not the gap day — cards populate.
+    assert v["latest"]["observation_day"] == "2026-01-02"
+    assert v["latest"]["oil_rate_bbl_day"] == 280.0
+    # trend.last skips the tail null; direction is computed, not a false "flat".
+    assert v["trend"]["oil_rate_last_bbl_day"] == 280.0
+    assert v["trend"]["oil_rate_change_pct"] is not None
+    assert v["trend"]["direction"] == "declining"  # 300 → 280 = -6.7%
+
+
+def test_projection_first_null_trend_first_populates():
+    # MIPA NO SLEEP shape: the FIRST day has no allocation.
+    rows = [_GAP, _day(280.0), _day(260.0)]
+    v = _project_values("W", _daily_frame(rows), telemetry_rows=3)
+
+    assert v["trend"]["oil_rate_first_bbl_day"] == 280.0  # skipped the leading null
+    assert v["trend"]["oil_rate_change_pct"] is not None
+    assert v["trend"]["direction"] == "declining"
+    assert v["latest"]["oil_rate_bbl_day"] == 260.0
+
+
+def test_projection_all_null_is_not_computable_no_false_flat():
+    rows = [_GAP, _GAP, _GAP]
+    v = _project_values("W", _daily_frame(rows), telemetry_rows=3)
+
+    assert v["period"]["n_days"] == 3  # rows still counted
+    assert v["trend"]["direction"] == "not_computable"  # NOT "flat"
+    assert v["trend"]["oil_rate_change_pct"] is None
+    assert v["latest"]["observation_day"] is None
+    assert v["latest"]["oil_rate_bbl_day"] is None
+
+
+def test_projection_single_valid_point_change_not_computable():
+    rows = [_GAP, _day(275.0), _GAP]
+    v = _project_values("W", _daily_frame(rows), telemetry_rows=3)
+
+    assert v["trend"]["oil_rate_change_pct"] is None  # one point → no change
+    assert v["trend"]["direction"] == "not_computable"
+    # ...but that single valid day still fills the KPI cards.
+    assert v["latest"]["observation_day"] == "2026-01-02"
+    assert v["latest"]["oil_rate_bbl_day"] == 275.0
+
+
+def test_projection_clean_window_unchanged():
+    # No gaps → behaves exactly as the raw first/last boundary read did.
+    rows = [_day(300.0 - i * 5) for i in range(5)]  # 300 → 280
+    v = _project_values("W", _daily_frame(rows), telemetry_rows=5)
+
+    assert v["trend"]["oil_rate_first_bbl_day"] == 300.0
+    assert v["trend"]["oil_rate_last_bbl_day"] == 280.0
+    assert v["trend"]["direction"] == "declining"
+    assert v["latest"]["observation_day"] == "2026-01-05"
+    assert v["latest"]["oil_rate_bbl_day"] == 280.0
 
 
 def test_production_history_schema_has_no_org_or_well():

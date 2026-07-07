@@ -145,6 +145,41 @@ def test_recommendation_comparison_validated(mock_rec):
     assert env["figure_ref"] == f"recommendation_comparison::{WELL}"
 
 
+# --- recommendation_comparison: % delta (M5 step-4 enrichment) -----------------
+
+
+def test_recommendation_comparison_carries_delta_pct(mock_rec):
+    # % delta beside each absolute delta: delta / current × 100 (normal case).
+    env = recommendation_comparison(dict(_TI))
+    freq = env["values"]["motor_frequency_hz"]
+    # freq: current 58, delta +4 → +6.9%. Existing keys untouched.
+    assert freq["current"] == 58.0 and freq["delta"] == pytest.approx(4.0)
+    assert freq["delta_pct"] == pytest.approx(4.0 / 58.0 * 100.0, abs=0.1)
+    # every compared field carries the new key
+    for field in (
+        "motor_frequency_hz", "tubing_pressure_psi", "liquid_rate_bpd",
+        "oil_rate_bpd", "water_rate_bpd", "gas_rate",
+    ):
+        assert "delta_pct" in env["values"][field]
+
+
+def test_recommendation_comparison_delta_pct_guards_zero_current(monkeypatch):
+    # current == 0 (or null) → delta_pct None, never a divide-by-zero / inf.
+    from curve import tools
+
+    proj = tools._project_recommendation_comparison_values(
+        WELL,
+        {"uuid": "rec-z"},
+        {
+            "cur_motor_frequency_hz": 0.0, "rec_motor_frequency_hz": 5.0, "delta_motor_frequency_hz": 5.0,
+            "cur_tubing_pressure_psi": None, "rec_tubing_pressure_psi": 10.0, "delta_tubing_pressure_psi": 10.0,
+        },
+        "max_oil",
+    )
+    assert proj["motor_frequency_hz"]["delta_pct"] is None  # current == 0
+    assert proj["tubing_pressure_psi"]["delta_pct"] is None  # current null
+
+
 # --- affinity_check: Validated/Estimated per provenance -----------------------
 
 

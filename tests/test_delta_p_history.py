@@ -186,6 +186,91 @@ def test_delta_p_composition_estimated_envelope(mock_fetch):
     assert isinstance(env["figure"], go.Figure)
 
 
+# --- M5 step-4 enrichment: affinity-normalized ΔP drift (delta_p_frequency) ----
+
+
+def test_dp_frequency_affinity_normalized_headline(mock_fetch):
+    # Fixture sweeps 55.0 → 57.9 Hz (Δf 2.9 > 0.5) → the block computes.
+    env = delta_p_frequency({"organization_id": ORG, "well_id": WELL})
+    an = env["values"]["affinity_normalized"]
+    assert an["reason"] is None
+    assert an["observed_delta_p_change_pct"] is not None
+    assert an["affinity_expected_delta_p_change_pct"] is not None
+    # headline = observed − affinity-expected
+    assert an["affinity_adjusted_delta_p_pct"] == pytest.approx(
+        round(an["observed_delta_p_change_pct"] - an["affinity_expected_delta_p_change_pct"], 1)
+    )
+    assert env["trust_label"] == "Estimated"  # first-order → stays Estimated
+
+
+def test_affinity_normalized_expected_is_n_squared():
+    from curve.tools import _affinity_normalized_dp
+
+    b = _affinity_normalized_dp(50.0, 60.0, 30.0)
+    # (60/50)² − 1 = 0.44 → +44.0% expected; adjusted = 30 − 44 = −14.0
+    assert b["affinity_expected_delta_p_change_pct"] == pytest.approx(44.0, abs=0.1)
+    assert b["affinity_adjusted_delta_p_pct"] == pytest.approx(-14.0, abs=0.1)
+
+
+def test_affinity_normalized_no_material_speed_change():
+    from curve.tools import _affinity_normalized_dp
+
+    b = _affinity_normalized_dp(55.0, 55.2, 12.0)  # Δf 0.2 < 0.5 Hz
+    assert b["affinity_expected_delta_p_change_pct"] is None
+    assert b["affinity_adjusted_delta_p_pct"] is None
+    assert b["observed_delta_p_change_pct"] == 12.0  # genuine observed change kept
+    assert "no material speed change" in b["reason"]
+
+
+def test_affinity_normalized_null_endpoint_is_honest():
+    from curve.tools import _affinity_normalized_dp
+
+    b = _affinity_normalized_dp(None, 60.0, 5.0)
+    assert b["affinity_expected_delta_p_change_pct"] is None
+    assert b["affinity_adjusted_delta_p_pct"] is None
+    assert "endpoints unavailable" in b["reason"]
+
+
+# --- M5 step-4 enrichment: friction split + %-composition + ΔP/PIP ratio -------
+
+
+def test_dp_composition_split_closes_and_ratio(mock_fetch):
+    env = delta_p_composition({"organization_id": ORG, "well_id": WELL})
+    comp = env["values"]["composition"]
+    assert comp["decomposable"] is True
+    # compute omits friction (p_dis = tubing + hyd) → residual ≈ 0
+    assert abs(comp["friction_psi"]) <= 1.0
+    pct = comp["composition_pct"]
+    assert pct["hydrostatic"] + pct["friction"] + pct["backpressure"] == pytest.approx(100.0, abs=0.5)
+    # drawdown severity present (ΔP_pump / PIP)
+    assert comp["delta_p_intake_ratio"] is not None
+
+
+def test_dp_composition_ratio_guards_zero_pip():
+    from curve.tools import _dp_composition_split
+
+    b = _dp_composition_split({
+        "delta_p_pump_psi": 3000.0, "delta_p_hyd_psi": 3500.0,
+        "tubing_pressure_psi": 250.0, "pump_intake_pressure_psi": 0.0,
+    })
+    assert b["delta_p_intake_ratio"] is None  # PIP == 0 → no divide
+
+
+def test_dp_composition_not_decomposable_on_negative_residual():
+    from curve.tools import _dp_composition_split
+
+    # Inconsistent inputs: hydrostatic + backpressure ≫ ΔP_pump → residual materially neg.
+    b = _dp_composition_split({
+        "delta_p_pump_psi": 100.0, "delta_p_hyd_psi": 3500.0,
+        "tubing_pressure_psi": 900.0, "pump_intake_pressure_psi": 200.0,
+    })
+    assert b["decomposable"] is False
+    assert b["friction_psi"] is None  # never a negative friction number
+    assert b["composition_pct"]["friction"] is None
+    assert "does not close" in b["reason"]
+    assert b["delta_p_intake_ratio"] == 0.5  # ratio still computed (independent)
+
+
 def test_rrc_depth_tier_fires_when_present(monkeypatch, mock_fetch):
     monkeypatch.setattr(well_depth, "fetch_well_depth_ft", lambda *a, **k: 9100.0)
     env = delta_p_frequency({"organization_id": ORG, "well_id": WELL})

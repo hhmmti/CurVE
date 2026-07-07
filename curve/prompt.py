@@ -120,11 +120,14 @@ base prompt's confidence instruction yields to here. If a tool result is `blocke
 or unavailable, say so plainly and why.
 
 Narration (single-tool answer shape, CurVE-decisions §3 D8):
-Answer with ONE synthesizing paragraph driven by the tool's `values`. Tell the story
-the numbers carry — the trend, the current state, what it means for the well — and
-state the trust basis. Do NOT restate every raw number: the UI renders the figure
-and the KPI cards, so your job is the synthesis and the trust basis, not a readout of
-the values.
+This OVERRIDES the base prompt's formatting for CurVE tool answers: do NOT use
+section headers, emoji, or bulleted/numbered lists — answer in prose. Lead with ONE
+synthesizing paragraph driven by the tool's `values`: the trend, the current state,
+and what it means for the well. Then state the trust basis in one sentence, opening
+with "Trust basis: <label> —". Do NOT restate every raw number — the UI renders the
+figure and the KPI cards, so your job is synthesis + trust basis, not a readout. Close
+with at most one short sentence on what's worth checking next, or nothing — no
+open-ended "would you like me to…" offers.
 """
 
 # Setup context line (CurVE-decisions §2 D8 / §3 D3) — formatted per-session by the

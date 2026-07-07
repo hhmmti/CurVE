@@ -33,7 +33,10 @@ from typing import Any, Callable, Dict, Optional
 import pandas as pd
 
 from compute import ideal_curve_overlay, ml_recommendation_calcs
-from compute.affinity_validator import compute_affinity_law_validator
+from compute.affinity_validator import (
+    MINIMAL_FREQ_CHANGE_HZ,
+    compute_affinity_law_validator,
+)
 from compute.energy_efficiency import compute_energy_efficiency_diagnostic
 from compute.preprocessed_calcs import WELL_DEPTH_FT
 from plotting.affinity_charts import build_affinity_law_panel
@@ -94,6 +97,64 @@ def _round(value: Any, ndigits: int = 1) -> Optional[float]:
         return None
 
 
+# --- history projection helpers (last-valid selection) ------------------------
+# A window boundary row can carry a null allocation (a day with no allocated
+# production nulls oil/water/gas together and drives liquid_rate to 0). Taking the
+# raw first/last row therefore misreads a data gap: the KPI cards blank out and the
+# trend reports a false "flat". These helpers reselect over the rows that actually
+# have data — per-series for the trend endpoints, and the last row with any
+# allocation for the "latest" block — mirroring the ΔP tools' "last valid reading"
+# semantics. The null grain is ROW-LEVEL (a missing allocation nulls the alloc_*
+# volumes together), so liquid_rate is NOT a validity anchor — the alloc_* are.
+
+_ALLOC_RATE_COLS = ("alloc_oil_vol", "alloc_water_vol", "alloc_gas_vol")
+
+
+def _valid_endpoints(daily: pd.DataFrame, field: str):
+    """First/last non-null values of ``field`` + the count of non-null observations.
+
+    Returns ``(first, last, n_valid)``. ``n_valid == 0`` → no data (both None);
+    ``n_valid == 1`` → a single observation (first == last, a change is not
+    computable); ``n_valid >= 2`` → two real endpoints to compute a change from.
+    """
+    if field not in daily.columns:
+        return None, None, 0
+    valid = daily[field].dropna()
+    if valid.empty:
+        return None, None, 0
+    return valid.iloc[0], valid.iloc[-1], int(len(valid))
+
+
+def _rate_trend(daily: pd.DataFrame, field: str, ndigits: int = 1):
+    """First/last/percent-change of ``field`` over its non-null observations only.
+
+    ``change_pct`` is None (not computable) unless there are ≥2 non-null points and a
+    non-zero base — so a data gap or a single point never masquerades as a computed 0%.
+    """
+    first, last, n_valid = _valid_endpoints(daily, field)
+    change_pct = None
+    if n_valid >= 2 and first not in (None, 0):
+        change_pct = round((last - first) / first * 100.0, 1)
+    return _round(first, ndigits), _round(last, ndigits), change_pct
+
+
+def _last_valid_rate_row(daily: pd.DataFrame):
+    """The last row carrying real allocation (any ``alloc_*`` non-null), else None.
+
+    The KPI ``latest`` anchor — the last day the well actually reported an allocated
+    rate — so a tail-null day no longer blanks the cards (last-valid semantics,
+    matching the ΔP tools). Anchors on the alloc_* volumes, never liquid_rate (which
+    is 0, not null, on a gap row).
+    """
+    cols = [c for c in _ALLOC_RATE_COLS if c in daily.columns]
+    if not cols or daily.empty:
+        return None
+    valid = daily[daily[cols].notna().any(axis=1)]
+    if valid.empty:
+        return None
+    return valid.iloc[-1]
+
+
 def _project_values(
     well_id: str,
     daily: pd.DataFrame,
@@ -120,27 +181,35 @@ def _project_values(
     latest: Dict[str, Any] = {}
     trend: Dict[str, Any] = {}
     if n_days:
-        last = daily.iloc[-1]
-        first = daily.iloc[0]
+        # KPI cards read the last day that actually reported allocation (last-valid),
+        # not the raw last row — so a tail-null day no longer blanks them.
+        valid_row = _last_valid_rate_row(daily)
+
+        def _lv(field: str, ndigits: int = 1) -> Optional[float]:
+            return _round(valid_row.get(field), ndigits) if valid_row is not None else None
+
         latest = {
-            "observation_day": str(last["observation_day"].date()),
-            "oil_rate_bbl_day": _round(last.get("alloc_oil_vol")),
-            "water_rate_bbl_day": _round(last.get("alloc_water_vol")),
-            "gas_rate_mcf_day": _round(last.get("alloc_gas_vol")),
-            "liquid_rate_bbl_day": _round(last.get("liquid_rate_bbl_day")),
-            "water_cut": _round(last.get("water_cut"), 3),
-            "gor": _round(last.get("gor")),
+            "observation_day": (
+                str(valid_row["observation_day"].date()) if valid_row is not None else None
+            ),
+            "oil_rate_bbl_day": _lv("alloc_oil_vol"),
+            "water_rate_bbl_day": _lv("alloc_water_vol"),
+            "gas_rate_mcf_day": _lv("alloc_gas_vol"),
+            "liquid_rate_bbl_day": _lv("liquid_rate_bbl_day"),
+            "water_cut": _lv("water_cut", 3),
+            "gor": _lv("gor"),
         }
-        oil_first = _round(first.get("alloc_oil_vol"))
-        oil_last = _round(last.get("alloc_oil_vol"))
-        change_pct = None
-        direction = "flat"
-        if oil_first not in (None, 0) and oil_last is not None:
-            change_pct = round((oil_last - oil_first) / oil_first * 100.0, 1)
+        # Trend endpoints are the first/last NON-NULL oil observations (per-series).
+        oil_first, oil_last, change_pct = _rate_trend(daily, "alloc_oil_vol")
+        # Honest not-computable when there aren't two real endpoints — never a false "flat".
+        direction = "not_computable"
+        if change_pct is not None:
             if change_pct <= -5:
                 direction = "declining"
             elif change_pct >= 5:
                 direction = "rising"
+            else:
+                direction = "flat"
         trend = {
             "oil_rate_first_bbl_day": oil_first,
             "oil_rate_last_bbl_day": oil_last,
@@ -231,34 +300,35 @@ def _project_wcg_values(
     latest: Dict[str, Any] = {}
     trend: Dict[str, Any] = {}
     if n_days:
-        last = daily.iloc[-1]
-        first = daily.iloc[0]
+        # Last day with real allocation (last-valid) — un-blanks the cards on tail-null wells.
+        valid_row = _last_valid_rate_row(daily)
+
+        def _lv(field: str, ndigits: int = 1) -> Optional[float]:
+            return _round(valid_row.get(field), ndigits) if valid_row is not None else None
+
         latest = {
-            "observation_day": str(last["observation_day"].date()),
-            "water_cut": _round(last.get("water_cut"), 3),
-            "gor": _round(last.get("gor")),
-            "liquid_rate_bbl_day": _round(last.get("liquid_rate_bbl_day")),
-            "oil_rate_bbl_day": _round(last.get("alloc_oil_vol")),
-            "water_rate_bbl_day": _round(last.get("alloc_water_vol")),
-            "gas_rate_mcf_day": _round(last.get("alloc_gas_vol")),
+            "observation_day": (
+                str(valid_row["observation_day"].date()) if valid_row is not None else None
+            ),
+            "water_cut": _lv("water_cut", 3),
+            "gor": _lv("gor"),
+            "liquid_rate_bbl_day": _lv("liquid_rate_bbl_day"),
+            "oil_rate_bbl_day": _lv("alloc_oil_vol"),
+            "water_rate_bbl_day": _lv("alloc_water_vol"),
+            "gas_rate_mcf_day": _lv("alloc_gas_vol"),
         }
-
-        def _delta(field: str, ndigits: int = 1):
-            v_first = _round(first.get(field), ndigits)
-            v_last = _round(last.get(field), ndigits)
-            change_pct = None
-            if v_first not in (None, 0) and v_last is not None:
-                change_pct = round((v_last - v_first) / v_first * 100.0, 1)
-            return v_first, v_last, change_pct
-
-        wc_first, wc_last, wc_change = _delta("water_cut", 3)
-        gor_first, gor_last, gor_change = _delta("gor")
-        direction = "flat"
+        # Per-series first/last NON-NULL endpoints — either boundary may be the null one.
+        wc_first, wc_last, wc_change = _rate_trend(daily, "water_cut", 3)
+        gor_first, gor_last, gor_change = _rate_trend(daily, "gor")
+        # Honest not-computable when water cut has no two real endpoints — never a false "flat".
+        direction = "not_computable"
         if wc_change is not None:
             if wc_change >= 5:
                 direction = "watering_up"
             elif wc_change <= -5:
                 direction = "drying_out"
+            else:
+                direction = "flat"
         trend = {
             "water_cut_first": wc_first,
             "water_cut_last": wc_last,
@@ -361,6 +431,41 @@ def _trend_of(daily: pd.DataFrame, field_name: str, ndigits: int = 1):
     return first, last, change_pct
 
 
+def _affinity_normalized_dp(hz_first, hz_last, observed_dp_change_pct) -> Dict[str, Any]:
+    """Frequency-normalized ΔP drift (endpoints-only, affinity-referenced).
+
+    Compares the observed ΔP change over the window against the change the affinity law
+    predicts from the speed change alone (ΔP ∝ N², fixed-point / first-order):
+
+      * ``affinity_expected_delta_p_change_pct`` = ((N_last/N_first)² − 1) × 100
+      * ``observed_delta_p_change_pct``          = the already-computed observed change
+      * ``affinity_adjusted_delta_p_pct``        = observed − affinity-expected (headline
+        drift against the speed change)
+
+    This is NOT a ΔP-on-Hz regression slope. It stays Estimated (first-order). When the
+    speed barely moved (|Δf| < ``MINIMAL_FREQ_CHANGE_HZ``) or an endpoint is missing, the
+    affinity-derived values are ``None`` with a reason — reporting a "drift" with no speed
+    change would just re-label the raw observed change as spurious drift.
+    """
+    block = {
+        "affinity_expected_delta_p_change_pct": None,
+        "observed_delta_p_change_pct": observed_dp_change_pct,
+        "affinity_adjusted_delta_p_pct": None,
+        "reason": None,
+    }
+    if hz_first in (None, 0) or hz_last is None or observed_dp_change_pct is None:
+        block["reason"] = "frequency or ΔP endpoints unavailable"
+        return block
+    if abs(hz_last - hz_first) < MINIMAL_FREQ_CHANGE_HZ:
+        block["reason"] = f"no material speed change (|Δf| < {MINIMAL_FREQ_CHANGE_HZ} Hz)"
+        return block
+    speed_ratio = hz_last / hz_first
+    expected = round((speed_ratio ** 2 - 1.0) * 100.0, 1)
+    block["affinity_expected_delta_p_change_pct"] = expected
+    block["affinity_adjusted_delta_p_pct"] = round(observed_dp_change_pct - expected, 1)
+    return block
+
+
 def _project_dp_frequency_values(
     well_id: str,
     daily: pd.DataFrame,
@@ -374,6 +479,7 @@ def _project_dp_frequency_values(
 
     latest: Dict[str, Any] = {}
     trend: Dict[str, Any] = {}
+    affinity_normalized: Dict[str, Any] = {}
     if len(daily):
         last = daily.iloc[-1]
         latest = {
@@ -397,14 +503,86 @@ def _project_dp_frequency_values(
             "motor_frequency_change_pct": hz_change,
             "direction": direction,
         }
+        # Frequency-normalized ΔP drift: observed ΔP change vs the (N_last/N_first)²
+        # affinity-expected change (replaces the model-inferred inverse read with data).
+        affinity_normalized = _affinity_normalized_dp(hz_first, hz_last, dp_change)
 
     return {
         "well_id": well_id,
         "period": _dp_period(daily, coverage),
         "latest": latest,
         "trend": trend,
+        "affinity_normalized": affinity_normalized,
         "inputs": resolved.as_values(),
     }
+
+
+# Rounding-noise band on the friction residual: p_dis_downhole = tubing + hyd (compute
+# omits friction), so the residual closes to ~0. A residual below −tol is a real
+# non-closing decomposition (bad inputs / sign error), not rounding → not-decomposable.
+_FRICTION_RESIDUAL_TOL_PSI = 1.0
+
+
+def _dp_composition_split(latest: Dict[str, Any]) -> Dict[str, Any]:
+    """Explicit friction term + %-composition split + ΔP_pump/PIP drawdown ratio.
+
+    Decomposes ΔP_pump into three additive terms that close the balance:
+      * ``hydrostatic_psi``  = ΔP_hyd (0.433·SG·depth)
+      * ``backpressure_psi`` = tubing_pressure − PIP (net surface-head-over-intake term;
+        legitimately negative when intake exceeds surface tubing pressure)
+      * ``friction_psi``     = the RESIDUAL that closes ΔP_pump − hydrostatic − backpressure.
+        Labeled as a residual, NOT a first-principles friction calc — it absorbs friction
+        and any unmodeled discharge term (≈0 while compute omits friction).
+
+    ``composition_pct`` is each term's share of ΔP_pump (sums to ~100; a share can exceed
+    100 / go negative when the hydrostatic column dominates and intake offsets it).
+    ``delta_p_intake_ratio`` = ΔP_pump / PIP is drawdown severity (guarded on PIP==0/null).
+    A materially-negative residual means the terms don't close → not-decomposable (honest
+    ``None`` + reason, never a negative friction number).
+    """
+    dp = latest.get("delta_p_pump_psi")
+    hyd = latest.get("delta_p_hyd_psi")
+    tub = latest.get("tubing_pressure_psi")
+    pip = latest.get("pump_intake_pressure_psi")
+
+    # Drawdown severity needs only ΔP_pump + PIP — independent of the decomposition.
+    ratio = None
+    if pip not in (None, 0) and dp is not None:
+        ratio = round(dp / pip, 2)
+
+    block = {
+        "hydrostatic_psi": hyd,
+        "backpressure_psi": None,
+        "friction_psi": None,
+        "delta_p_pump_psi": dp,
+        "composition_pct": {"hydrostatic": None, "friction": None, "backpressure": None},
+        "delta_p_intake_ratio": ratio,
+        "decomposable": False,
+        "reason": None,
+    }
+
+    if dp in (None, 0) or hyd is None or tub is None or pip is None:
+        block["reason"] = "ΔP_pump or a component input unavailable"
+        return block
+
+    backpressure = round(tub - pip, 1)
+    friction = round(dp - hyd - backpressure, 1)
+    block["backpressure_psi"] = backpressure
+
+    if friction < -_FRICTION_RESIDUAL_TOL_PSI:
+        # Terms don't close — report rather than emit a negative friction / bogus split.
+        block["reason"] = "decomposition does not close (residual materially negative)"
+        return block
+
+    friction = max(friction, 0.0)  # clamp rounding-noise negatives to a clean 0
+    block["friction_psi"] = friction
+    block["composition_pct"] = {
+        "hydrostatic": round(hyd / dp * 100.0, 1),
+        "friction": round(friction / dp * 100.0, 1),
+        "backpressure": round(backpressure / dp * 100.0, 1),
+    }
+    block["decomposable"] = True
+    return block
 
 
 def _project_dp_composition_values(
@@ -420,6 +598,7 @@ def _project_dp_composition_values(
 
     latest: Dict[str, Any] = {}
     trend: Dict[str, Any] = {}
+    composition: Dict[str, Any] = {}
     if len(daily):
         last = daily.iloc[-1]
         latest = {
@@ -444,12 +623,15 @@ def _project_dp_composition_values(
             "delta_p_hyd_change_pct": hyd_change,
             "direction": direction,
         }
+        # Explicit friction residual + %-composition split + drawdown-severity ratio.
+        composition = _dp_composition_split(latest)
 
     return {
         "well_id": well_id,
         "period": _dp_period(daily, coverage),
         "latest": latest,
         "trend": trend,
+        "composition": composition,
         "inputs": resolved.as_values(),
     }
 
@@ -681,10 +863,19 @@ def _project_recommendation_comparison_values(
     pressure, and the production rates.
     """
     def _triple(cur_key: str, rec_key: str, delta_key: str, nd: int = 1):
+        current = _round(compare_row.get(cur_key), nd)
+        recommended = _round(compare_row.get(rec_key), nd)
+        delta = _round(compare_row.get(delta_key), nd)
+        # % delta beside the absolute delta; guard current == 0/null → None (never a
+        # divide-by-zero or an infinite %). Existing keys are untouched.
+        delta_pct = None
+        if current not in (None, 0) and delta is not None:
+            delta_pct = round(delta / current * 100.0, 1)
         return {
-            "current": _round(compare_row.get(cur_key), nd),
-            "recommended": _round(compare_row.get(rec_key), nd),
-            "delta": _round(compare_row.get(delta_key), nd),
+            "current": current,
+            "recommended": recommended,
+            "delta": delta,
+            "delta_pct": delta_pct,
         }
 
     return {

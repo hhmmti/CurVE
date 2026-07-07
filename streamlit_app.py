@@ -14,10 +14,16 @@ loop / tool / gate / session logic of its own.
 Mirrors the deployed operator UX (CurVE-decisions §2 D6): front-loaded setup step
 THEN chat. No pump pick (production_history is connection-free).
 
-ASSUMPTION (flagged): the well dropdown is a small **configurable known-well list**
-for the demo (``CURVE_KNOWN_WELLS`` env JSON, or the ``Manual entry`` option).
-Production would populate it by querying the operator's own wells. Either way every
-query filters by the selected ``organization_id`` (no cross-org data).
+Well selection (M5 step 3): the setup sidebar offers **dependent org → well
+dropdowns** enumerated from the VE well-configuration table
+(``roam_prd_ddb.default.esp_well_configuration_v2``, via
+:mod:`curve.well_catalog`) — picking an org filters its wells. The enumeration is
+``@st.cache_data``-cached (slow-changing; TTL + a manual refresh button). A
+``Manual entry…`` option is retained so an off-catalog well can still be run, and an
+enumeration failure falls back to manual entry with a visible notice (never a crash).
+This is enumeration/UX only: the chosen org/well feed the same setup path as typed
+entry, and every downstream query still filters by the selected ``organization_id``
+(no cross-org data).
 
 Run:
     aws sso login --profile roam-ai
@@ -26,7 +32,6 @@ Run:
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -35,7 +40,15 @@ import pandas as pd
 import streamlit as st
 
 from cli import _estimate_cost_usd  # reuse the M1 cost estimator (no logic copied)
-from curve import data, delta_p_inputs, ideal_catalog, recommendations, session, well_depth
+from curve import (
+    data,
+    delta_p_inputs,
+    ideal_catalog,
+    recommendations,
+    session,
+    well_catalog,
+    well_depth,
+)
 from curve.engine import run_curve_turn
 from curve.gate import run_tool_gate
 from curve.tools import (
@@ -54,21 +67,9 @@ _REC_TOOLS = ("recommendation_comparison", "affinity_check", "energy_efficiency"
 
 DEFAULT_PROFILE = os.environ.get("CURVE_AWS_PROFILE", "roam-ai")
 
-# Configurable known-well list (demo). Override with CURVE_KNOWN_WELLS as a JSON list
-# of {"label","organization_id","well_id"}. Empty by default so the operator either
-# sets the env var or uses the Manual-entry option — no fake ids baked in.
-def _load_known_wells() -> List[Dict[str, str]]:
-    raw = os.environ.get("CURVE_KNOWN_WELLS")
-    if not raw:
-        return []
-    try:
-        wells = json.loads(raw)
-        return [w for w in wells if w.get("organization_id") and w.get("well_id")]
-    except (ValueError, TypeError):
-        return []
-
-
-KNOWN_WELLS = _load_known_wells()
+# Manual-entry sentinel — the retained free-text fallback for off-catalog wells (and
+# the graceful fallback when enumeration returns nothing / fails).
+MANUAL_ENTRY = "Manual entry…"
 
 _TRUST_BADGE = {
     "Validated": ("#1a7f37", "✅ Validated"),
@@ -125,6 +126,19 @@ def _coverage(telemetry_df, production_df) -> Dict[str, Any]:
         "min_day": max(mins) if len(mins) == 2 else (mins[0] if mins else None),
         "max_day": min(maxs) if len(maxs) == 2 else (maxs[0] if maxs else None),
     }
+
+
+@st.cache_data(ttl=3600, show_spinner="Enumerating wells…")
+def _enumerate_org_wells(profile: str) -> Dict[str, List[str]]:
+    """Cached org→wells enumeration for the setup dropdowns (M5 step 3).
+
+    Reads distinct (org, well) from ``roam_prd_ddb.default.esp_well_configuration_v2``
+    via :mod:`curve.well_catalog` (the existing awswrangler/Athena read path). Keyed on
+    the AWS profile so switching profiles re-queries; a 1-hour TTL plus the sidebar's
+    "Refresh well list" button (``_enumerate_org_wells.clear()``) keep it from going
+    permanently stale. Slow-changing config table → must not re-query every rerun.
+    """
+    return well_catalog.fetch_org_well_map(profile_name=profile or None)
 
 
 @st.cache_data(show_spinner=False)
@@ -317,6 +331,49 @@ def _render_dp_kpis(values: Dict[str, Any]) -> None:
             if depth is not None
             else f"Window: {period.get('start')} → {period.get('end')}"
         )
+
+    # delta_p_frequency only: frequency-normalized ΔP drift (affinity-referenced).
+    affinity_norm = (values or {}).get("affinity_normalized")
+    if affinity_norm:
+        d1, d2, d3, _d4 = st.columns(4)
+        adj = affinity_norm.get("affinity_adjusted_delta_p_pct")
+        d1.metric(
+            "ΔP drift vs affinity",
+            f"{adj:+.1f}%" if adj is not None else "—",
+            help="observed ΔP change minus the (N₂/N₁)² affinity-expected change",
+        )
+        exp = affinity_norm.get("affinity_expected_delta_p_change_pct")
+        d2.metric("Affinity-expected ΔP", f"{exp:+.1f}%" if exp is not None else "—")
+        obs = affinity_norm.get("observed_delta_p_change_pct")
+        d3.metric("Observed ΔP change", f"{obs:+.1f}%" if obs is not None else "—")
+        if affinity_norm.get("reason"):
+            st.caption(f"Affinity-normalized ΔP not computed: {affinity_norm.get('reason')}")
+
+    # delta_p_composition only: friction/%-split + ΔP_pump/PIP drawdown ratio.
+    composition = (values or {}).get("composition")
+    if composition:
+        pct = composition.get("composition_pct") or {}
+        e1, e2, e3, e4 = st.columns(4)
+        ratio = composition.get("delta_p_intake_ratio")
+        e1.metric(
+            "ΔP/PIP (drawdown)",
+            f"{ratio:.2f}" if ratio is not None else "—",
+            help="ΔP_pump ÷ pump-intake pressure — drawdown severity",
+        )
+        e2.metric(
+            "Hydrostatic share",
+            f"{pct.get('hydrostatic'):.0f}%" if pct.get("hydrostatic") is not None else "—",
+        )
+        e3.metric(
+            "Backpressure share",
+            f"{pct.get('backpressure'):.0f}%" if pct.get("backpressure") is not None else "—",
+        )
+        e4.metric(
+            "Friction share (resid.)",
+            f"{pct.get('friction'):.0f}%" if pct.get("friction") is not None else "—",
+        )
+        if not composition.get("decomposable", True) and composition.get("reason"):
+            st.caption(f"ΔP composition not decomposable: {composition.get('reason')}")
 
 
 def _render_recommendation_comparison_kpis(values: Dict[str, Any]) -> None:
@@ -746,16 +803,43 @@ def render_page() -> None:
         _set_aws_profile(profile)
         dev_mode = st.checkbox("Developer mode (expose the loop)", value=True)
 
-        options = [w["label"] for w in KNOWN_WELLS] + ["Manual entry…"]
-        choice = st.selectbox("Select a well", options, index=0)
+        # Dependent org → well dropdowns, enumerated (cached) from the VE
+        # well-configuration table. Enumeration failure or an empty result falls back
+        # to manual entry with a visible notice — the sidebar never crashes.
+        org_well_map: Dict[str, List[str]] = {}
+        enum_error: Optional[str] = None
+        try:
+            org_well_map = _enumerate_org_wells(profile)
+        except Exception as exc:  # surface auth/data errors, don't crash the sidebar
+            enum_error = str(exc)
 
-        if choice == "Manual entry…":
+        if st.button("↻ Refresh well list"):
+            _enumerate_org_wells.clear()
+            st.rerun()
+
+        if enum_error:
+            st.warning(
+                f"Could not load the well list ({enum_error}). Falling back to manual entry."
+            )
+            org_choice = MANUAL_ENTRY
+        elif not org_well_map:
+            st.info("No wells enumerated from the catalog. Falling back to manual entry.")
+            org_choice = MANUAL_ENTRY
+        else:
+            org_options = sorted(org_well_map) + [MANUAL_ENTRY]
+            org_choice = st.selectbox("Organization", org_options, index=0)
+
+        if org_choice == MANUAL_ENTRY:
             organization_id = st.text_input("organization_id")
             well_id = st.text_input("well_id")
         else:
-            well = next(w for w in KNOWN_WELLS if w["label"] == choice)
-            organization_id, well_id = well["organization_id"], well["well_id"]
-            st.text(f"org:  {organization_id}\nwell: {well_id}")
+            organization_id = org_choice
+            wells = org_well_map.get(org_choice, [])
+            if wells:
+                well_id = st.selectbox("Well", wells, index=0)
+            else:
+                well_id = ""
+                st.info("No wells for this organization.")
 
         start_setup = st.button("Run setup / availability", type="primary")
 
