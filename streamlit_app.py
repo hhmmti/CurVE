@@ -39,8 +39,8 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
-from cli import _estimate_cost_usd  # reuse the M1 cost estimator (no logic copied)
 from curve import (
+    config,
     data,
     delta_p_inputs,
     ideal_catalog,
@@ -49,6 +49,7 @@ from curve import (
     well_catalog,
     well_depth,
 )
+from curve.cost import estimate_cost_usd  # shared cost estimator (no logic copied)
 from curve.engine import run_curve_turn
 from curve.gate import run_tool_gate
 from curve.tools import (
@@ -65,7 +66,7 @@ _DELTA_P_TOOLS = ("delta_p_frequency", "delta_p_composition")
 # the recommendation-absence hard block, front-loaded here per-well.
 _REC_TOOLS = ("recommendation_comparison", "affinity_check", "energy_efficiency")
 
-DEFAULT_PROFILE = os.environ.get("CURVE_AWS_PROFILE", "roam-ai")
+DEFAULT_PROFILE = config.AWS_PROFILE
 
 # Manual-entry sentinel — the retained free-text fallback for off-catalog wells (and
 # the graceful fallback when enumeration returns nothing / fails).
@@ -529,7 +530,7 @@ def _render_dev_panel(entry: Dict[str, Any]) -> None:
         st.write(
             {
                 "usage": usage,
-                "estimated_cost_usd": round(_estimate_cost_usd(usage), 4),
+                "estimated_cost_usd": round(estimate_cost_usd(usage), 4),
             }
         )
         st.markdown("**Per-tool gate verdict + model-facing envelope** (figure stripped):")
@@ -801,7 +802,11 @@ def render_page() -> None:
         st.header("Setup")
         profile = st.text_input("AWS SSO profile", value=DEFAULT_PROFILE)
         _set_aws_profile(profile)
-        dev_mode = st.checkbox("Developer mode (expose the loop)", value=True)
+        # Dev panel default comes from config (CURVE_DEV_PANEL): OFF for the company
+        # copy, on when the flag is set. Still toggleable per-session via the checkbox.
+        dev_mode = st.checkbox(
+            "Developer mode (expose the loop)", value=config.DEV_PANEL_DEFAULT
+        )
 
         # Dependent org → well dropdowns, enumerated (cached) from the VE
         # well-configuration table. Enumeration failure or an empty result falls back

@@ -11,14 +11,9 @@ Verified across all three label outcomes:
   * not-ready / blocked — zero PIP coverage, or a missing x-axis (projection) input.
 """
 
-import os
-import sys
-
 import pandas as pd
 import plotly.graph_objects as go
 import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from curve import data, delta_p_inputs, gate as gate_mod, session, well_depth  # noqa: E402
 from curve.delta_p_inputs import resolve_delta_p_inputs  # noqa: E402

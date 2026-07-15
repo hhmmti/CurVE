@@ -33,13 +33,16 @@ from typing import Optional, Tuple
 import boto3
 import pandas as pd
 
+from curve import config
+
 # VE-canonical preprocessed source. Catalog confirmed identical to roam_prd_products.
-CURVE_CATALOG = "roam_prd_products"
-CURVE_DATABASE = "esp_optimization_v2"
-CURVE_TELEMETRY_TABLE = "esp_telemetry_preprocessed"
-CURVE_PRODUCTION_TABLE = "esp_production_preprocessed"
-CURVE_ATHENA_S3_OUTPUT = "s3://esp-athena-results-v2-411237692998/"
-CURVE_REGION = "us-east-1"
+# Sourced from curve.config (env-overridable; defaults equal the prior literals).
+CURVE_CATALOG = config.PREPROCESSED_CATALOG
+CURVE_DATABASE = config.PREPROCESSED_DATABASE
+CURVE_TELEMETRY_TABLE = config.TELEMETRY_TABLE
+CURVE_PRODUCTION_TABLE = config.PRODUCTION_TABLE
+CURVE_ATHENA_S3_OUTPUT = config.ATHENA_S3_OUTPUT
+CURVE_REGION = config.AWS_REGION
 
 
 def _quote(value: str) -> str:

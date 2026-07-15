@@ -1,27 +1,11 @@
-"""Service layer package for workflow orchestration.
+"""Service layer for CurVE — the two workflow modules CurVE consumes.
 
-NOTE: Vital Energy services have been removed from the active app layer.
-Legacy Vital service functions remain in app_service.py for reference only.
+Only the clean, physics/pandas-backed modules CurVE actually imports live here:
+  * ``preprocessed_pipeline_service`` — the join + engineered-dataframe pipeline
+  * ``data_availability_gate``        — the availability gate the per-tool gate adapts
+
+Both import nothing but ``compute`` / numpy / pandas. The other service modules from
+the original app (``ml_recommendation_service``, ``ideal_curve_service``,
+``pipeline_service``, ``app_service``, ``extension_hooks``) reach into a ``data/``
+layer that is not part of the CurVE slice and are intentionally not carried over.
 """
-
-from .extension_hooks import AnalysisExtensionHooks
-from .pipeline_service import run_full_pipeline
-from .ml_recommendation_service import (
-	build_analysis_from_latest_row,
-	select_pump_row,
-)
-from .data_availability_gate import (
-	run_data_availability_gate,
-	build_readiness_dataframe,
-	summarize_readiness,
-)
-
-__all__ = [
-	"AnalysisExtensionHooks",
-	"select_pump_row",
-	"run_full_pipeline",
-	"build_analysis_from_latest_row",
-	"run_data_availability_gate",
-	"build_readiness_dataframe",
-	"summarize_readiness",
-]

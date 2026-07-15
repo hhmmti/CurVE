@@ -20,11 +20,14 @@ from typing import Any, Dict, List, Optional
 
 import boto3
 
+from curve import config
+
 # Cross-region inference profile for Claude Sonnet 4.6 (US). On-demand invocation
 # of the bare base model id is not supported; the prefixed profile id is required.
-CURVE_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
-CURVE_REGION = "us-east-1"
-CURVE_DEFAULT_PROFILE = "roam-ai"
+# Sourced from curve.config (env-overridable; defaults equal the prior literals).
+CURVE_MODEL_ID = config.BEDROCK_MODEL_ID
+CURVE_REGION = config.AWS_REGION
+CURVE_DEFAULT_PROFILE = config.AWS_PROFILE
 
 # Inference defaults. Note maxTokens is modest here vs. the VE's 131k — M1 routes
 # on stubs, it does not need huge completions.

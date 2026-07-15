@@ -240,27 +240,3 @@ def profile_data_quality(
         )
 
     return pd.DataFrame(audit_rows)
-
-
-def check_pump_intake_fallback_needed(df: pd.DataFrame, threshold: float = 0.45) -> bool:
-    """
-    Determine if pump intake pressure fallback is needed.
-
-    Fallback activates when null+zero exceeds threshold (default 45%).
-
-    Args:
-        df: DataFrame with 'pump_intake_pressure_psi' column
-        threshold: Fallback activation threshold (default 0.45)
-
-    Returns:
-        Boolean indicating if fallback is needed
-    """
-    intake_col = df.get("pump_intake_pressure_psi", pd.Series(dtype=float))
-    if len(intake_col) == 0:
-        return True
-
-    intake = pd.to_numeric(intake_col, errors="coerce")
-    invalid_count = (intake.isna() | (intake == 0)).sum()
-    invalid_pct = invalid_count / len(intake) if len(intake) > 0 else 1.0
-
-    return invalid_pct > threshold

@@ -11,14 +11,9 @@ Covers:
   * the gate ALIAS layer: GOR_scf_bbl → gor_scf_bbl, and pair-extensibility
 """
 
-import os
-import sys
-
 import pandas as pd
 import plotly.graph_objects as go
 import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from curve import data, gate as gate_mod, session  # noqa: E402
 from curve.engine import run_curve_turn  # noqa: E402

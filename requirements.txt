@@ -1,9 +1,16 @@
-# CurVE dependencies (M1 + M2 core).
-# boto3 recent enough for the Bedrock Converse API + the Claude Sonnet 4.6
-# inference profile (us.anthropic.claude-sonnet-4-6).
-boto3>=1.35.0
-# M2: real Athena fetch (awswrangler) + vendored compute/plotting (pandas, plotly).
-awswrangler>=3.0
-pandas>=2.0
-plotly>=5.0
-pytest>=7.4
+# CurVE — runtime + test dependencies, pinned (==) from the working venv.
+# Python 3.12.8 (see .python-version). Direct dependencies only; transitives resolve
+# to compatible releases. Re-pin from `pip freeze` if the venv is rebuilt.
+
+# Bedrock Converse tool loop.
+boto3==1.42.64
+# Live Athena fetch (lazy-imported in curve/data.py; mocked in tests).
+awswrangler==3.15.1
+# Vendored compute/ + plotting/ physics and charts.
+numpy==2.5.0
+pandas==2.2.2
+plotly==5.24.1
+# Streamlit surface (streamlit_app.py).
+streamlit==1.37.1
+# Test suite.
+pytest==9.0.3

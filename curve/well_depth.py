@@ -2,7 +2,7 @@
 
 The ΔP history tools need a real well depth for the hydrostatic term. The week-8
 physics app already reads RRC-mined depth; this module **ports that exact read** into
-``playground`` as its own small awswrangler query (it does NOT copy the app's data
+CurVE as its own small awswrangler query (it does NOT copy the app's data
 layer wholesale, and it does NOT re-implement physics).
 
 WHERE THE READ CAME FROM (resolved during execution, per prompt #4 step 1):
@@ -39,13 +39,16 @@ from typing import Optional
 
 import boto3
 
+from curve import config
+
 # Ported verbatim from the app's data/well_depth_db.py (the known-good binding).
-RRC_CATALOG = "roam_dev_products"
-RRC_DATABASE = "well_depth_dev"
-RRC_TABLE = "rrc_well_depth"
+# Sourced from curve.config (env-overridable; defaults equal the prior literals).
+RRC_CATALOG = config.WELL_DEPTH_CATALOG
+RRC_DATABASE = config.WELL_DEPTH_DATABASE
+RRC_TABLE = config.WELL_DEPTH_TABLE
 RRC_DEPTH_COLUMN = "API Depth"
-RRC_ATHENA_S3_OUTPUT = "s3://esp-athena-results-v2-411237692998/"
-RRC_REGION = "us-east-1"
+RRC_ATHENA_S3_OUTPUT = config.ATHENA_S3_OUTPUT
+RRC_REGION = config.AWS_REGION
 
 
 def _build_session(

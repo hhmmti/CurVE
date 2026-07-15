@@ -15,13 +15,9 @@ Verified outcomes:
 """
 
 import json
-import os
-import sys
 
 import plotly.graph_objects as go
 import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from curve import recommendations, session, well_depth  # noqa: E402
 from curve.engine import run_curve_turn  # noqa: E402

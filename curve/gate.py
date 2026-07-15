@@ -24,8 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-# Loaded by path to skip the broken vendored services/__init__.py (see curve._vendored).
-from ._vendored import data_availability_gate
+from services import data_availability_gate
 
 run_data_availability_gate = data_availability_gate.run_data_availability_gate
 

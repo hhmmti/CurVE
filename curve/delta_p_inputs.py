@@ -22,8 +22,7 @@ PRECEDENCE (prompt #4 core contract):
   * PIP: measured-or-missing — NEVER defaulted, NEVER proxied. PIP is not resolved
     here; the vendored service nulls non-positive intake and ΔP is NaN on PIP-absent
     rows. Coverage is *read* from the computed frame by :func:`pip_coverage` (the #2
-    intake-state truth — read, not re-derived; ``check_pump_intake_fallback_needed``
-    is deliberately NOT called).
+    intake-state truth — read, not re-derived; no PIP fallback/imputation is applied).
 
 TRUST RULE (the precedent for every later Estimated tool):
   all inputs measured/real → ``Validated``; any input from a **default OR an operator

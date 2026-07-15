@@ -21,7 +21,7 @@ of the same mirror table the VE's DDB replicates:
                summary_data_json
     query    : SELECT … ORDER BY timestamp DESC LIMIT 1   (latest per org/well)
 
-This module ports **that exact read** into ``playground`` as its own small
+This module ports **that exact read** into CurVE as its own small
 awswrangler query (the ``curve.data`` access pattern — NOT a copy of the app's data
 layer wholesale, and NOT physics). The blobs carried confirm the schema CurVE needs:
 ``uuid`` (traceability), ``current_setpoint`` + ``model_setpoint_recommendations``
@@ -63,6 +63,8 @@ from typing import Any, Dict, Optional
 
 import boto3
 
+from curve import config
+
 # Default recommendation method/goal branch — matches the app's default
 # (``build_analysis_from_latest_row(method="max_oil")``). The VE keys the recommended
 # setpoint on the goal function; "max_oil" is CurVE's default goal until a session
@@ -70,11 +72,12 @@ import boto3
 DEFAULT_RECOMMENDATION_METHOD = "max_oil"
 
 # Athena mirror of the VE's DDB recommendations (ported from the app's data layer).
-REC_CATALOG = "roam_prd_ddb"  # DynamoDB via the Athena connector
-REC_DATABASE = "default"
-REC_TABLE = "esp_setpoint_recommendations_v2"
-REC_ATHENA_S3_OUTPUT = "s3://esp-athena-results-v2-411237692998/"
-REC_REGION = "us-east-1"
+# Sourced from curve.config (env-overridable; defaults equal the prior literals).
+REC_CATALOG = config.REC_CATALOG  # DynamoDB via the Athena connector
+REC_DATABASE = config.REC_DATABASE
+REC_TABLE = config.REC_TABLE
+REC_ATHENA_S3_OUTPUT = config.ATHENA_S3_OUTPUT
+REC_REGION = config.AWS_REGION
 
 # 3-phase power, matching the VE's _compute_motor_power_kwh_per_day (PF fixed at 0.85,
 # √3 ≈ 1.7321) — see actions.py L3269. We mirror the VE's constants exactly so the

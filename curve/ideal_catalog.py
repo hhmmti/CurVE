@@ -69,18 +69,20 @@ from typing import Any, Dict, List, Optional
 import boto3
 import pandas as pd
 
+from . import config
 from . import session as session_mod
 
 # Resolved ideal-catalog location (ported from the app's data layer — NOT guessed).
-IDEAL_CATALOG_CATALOG = "roam_dev_products"
-IDEAL_CATALOG_DATABASE = "esp_ideal_pump_dev"
-IDEAL_CATALOG_TABLE = "ideal_pump_library_v1"
-IDEAL_CATALOG_S3_OUTPUT = "s3://esp-athena-results-v2-411237692998/"
-IDEAL_CATALOG_REGION = "us-east-1"
+# Sourced from curve.config (env-overridable; defaults equal the prior literals).
+IDEAL_CATALOG_CATALOG = config.IDEAL_CATALOG_CATALOG
+IDEAL_CATALOG_DATABASE = config.IDEAL_CATALOG_DATABASE
+IDEAL_CATALOG_TABLE = config.IDEAL_CATALOG_TABLE
+IDEAL_CATALOG_S3_OUTPUT = config.ATHENA_S3_OUTPUT
+IDEAL_CATALOG_REGION = config.AWS_REGION
 
 # The app's BEP-tolerance slider default (0.25 = ±25%). Plumbed as a setup-injected
 # parameter so the Streamlit slider maps straight onto it (see :func:`bep_tolerance_from_context`).
-DEFAULT_BEP_TOLERANCE = 0.25
+DEFAULT_BEP_TOLERANCE = config.DEFAULT_BEP_TOLERANCE
 
 # Curve-reconstruction coeffs (vendored ``compute.ideal_curve_overlay`` reads
 # ``ideal_head_c1..c6`` + ``ideal_power_c1..c6``). All 12 must be finite for a row to

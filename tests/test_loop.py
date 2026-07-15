@@ -14,11 +14,6 @@ Covered:
 """
 
 import copy
-import os
-import sys
-
-# Make the package importable when pytest is run from the repo root or tests/.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from curve.engine import run_curve_turn  # noqa: E402
 from curve.tools import TOOL_REGISTRY  # noqa: E402

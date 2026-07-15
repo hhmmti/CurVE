@@ -32,12 +32,15 @@ from typing import Dict, List, Optional
 
 import boto3
 
+from curve import config
+
 # VE well-configuration table — same catalog/database as the recommendation mirror.
-WELLCFG_CATALOG = "roam_prd_ddb"  # DynamoDB via the Athena connector
-WELLCFG_DATABASE = "default"
-WELLCFG_TABLE = "esp_well_configuration_v2"
-WELLCFG_ATHENA_S3_OUTPUT = "s3://esp-athena-results-v2-411237692998/"
-WELLCFG_REGION = "us-east-1"
+# Sourced from curve.config (env-overridable; defaults equal the prior literals).
+WELLCFG_CATALOG = config.WELLCFG_CATALOG  # DynamoDB via the Athena connector
+WELLCFG_DATABASE = config.WELLCFG_DATABASE
+WELLCFG_TABLE = config.WELLCFG_TABLE
+WELLCFG_ATHENA_S3_OUTPUT = config.ATHENA_S3_OUTPUT
+WELLCFG_REGION = config.AWS_REGION
 
 
 def _build_session(

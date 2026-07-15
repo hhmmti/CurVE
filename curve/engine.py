@@ -19,6 +19,7 @@ this same entry without touching the loop. That action is NOT built in M1.
 
 from typing import Any, Callable, Dict, List, Optional
 
+from . import config
 from .prompt import CURVE_SYSTEM_PROMPT, format_setup_context
 from .tools import NON_MODEL_RESULT_KEYS, TOOL_REGISTRY, build_tool_config
 from .wrapper import CurveBedrockWrapper
@@ -69,7 +70,7 @@ def run_curve_turn(
     system_prompt: Optional[str] = None,
     session: Optional[Dict[str, Any]] = None,
     profile_name: Optional[str] = None,
-    region_name: str = "us-east-1",
+    region_name: str = config.AWS_REGION,
     enable_thinking: bool = True,
     max_iterations: int = MAX_ITERATIONS,
     verbose: bool = False,

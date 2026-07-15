@@ -15,14 +15,9 @@ Covered:
     the model-facing result.
 """
 
-import os
-import sys
-
 import numpy as np
 import pandas as pd
 import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from curve import curve_position as cp_layer  # noqa: E402
 from curve import data, ideal_catalog, tools, well_depth  # noqa: E402

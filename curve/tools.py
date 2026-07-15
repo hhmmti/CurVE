@@ -61,7 +61,7 @@ from . import (
     recommendations,
     well_depth,
 )
-from ._vendored import preprocessed_pipeline_service
+from services import preprocessed_pipeline_service
 from .envelope import error_envelope, success_envelope
 from .gate import (
     recommendation_absence_block,
@@ -73,7 +73,7 @@ from .gate import (
     run_tool_gate,
 )
 
-# Vendored pipeline fns (loaded by path to skip the broken services/__init__.py).
+# Pipeline fns from the services layer.
 prepare_daily_data = preprocessed_pipeline_service.prepare_daily_data
 run_preprocessed_analysis = preprocessed_pipeline_service.run_preprocessed_analysis
 

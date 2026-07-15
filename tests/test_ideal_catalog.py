@@ -15,14 +15,9 @@ Covered:
   * total fluid = median liquid rate (oil+water), not oil; fetch validates the schema.
 """
 
-import os
-import sys
-
 import numpy as np
 import pandas as pd
 import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from curve import ideal_catalog, session  # noqa: E402
 from curve.engine import run_curve_turn  # noqa: E402

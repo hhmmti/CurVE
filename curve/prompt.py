@@ -9,7 +9,7 @@ SNAPSHOT CAVEAT
 ``_VE_SYSTEM_PROMPT_SNAPSHOT`` below is a **verbatim snapshot** of
 ``VIRTUAL_ENGINEER_SYSTEM_PROMPT`` from the monorepo
 (``python-packages/esp_resources_v2/esp_resources_v2/llm/prompts.py``), taken for
-M1. The playground cannot import the monorepo package, so the text is copied here.
+M1. CurVE cannot import the monorepo package, so the text is copied here.
 **It can drift** from the live VE prompt — re-syncing against the live base is a
 monorepo-time concern (handled when CurVE lands in the monorepo, where the live
 constant can be imported instead of snapshotted). Do not treat this copy as the
