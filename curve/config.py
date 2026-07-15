@@ -78,6 +78,16 @@ def _get_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _get_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 # --- AWS / Bedrock ------------------------------------------------------------
 
 AWS_PROFILE = _get("CURVE_AWS_PROFILE", "roam-ai")
@@ -124,6 +134,14 @@ IDEAL_CATALOG_TABLE = _get("CURVE_IDEAL_CATALOG_TABLE", "ideal_pump_library_v1")
 
 # BEP-tolerance slider default (0.25 = ±25%), the app's narrow-catalog window.
 DEFAULT_BEP_TOLERANCE = _get_float("CURVE_DEFAULT_BEP_TOLERANCE", 0.25)
+
+# --- sql_query guard (M2) pins ------------------------------------------------
+# The single hard row cap the guard forces onto every generated query. Absent LIMIT
+# is injected at this value; a model LIMIT above it is REJECTED (never clamped).
+SQL_QUERY_LIMIT_CAP = _get_int("CURVE_SQL_QUERY_LIMIT_CAP", 10000)
+# Client-side wall-clock budget for execute(); on breach the query is cancelled with
+# stop_query_execution and the call aborts (fail-closed — never an unbounded wait).
+SQL_QUERY_TIMEOUT_SECONDS = _get_float("CURVE_SQL_QUERY_TIMEOUT_SECONDS", 60.0)
 
 # --- UI flags -----------------------------------------------------------------
 

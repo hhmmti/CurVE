@@ -12,5 +12,7 @@ pandas==2.2.2
 plotly==5.24.1
 # Streamlit surface (streamlit_app.py).
 streamlit==1.37.1
+# SQL guard: parse generated SQL to an AST for the M2 sql_query choke point.
+sqlglot==27.16.3
 # Test suite.
 pytest==9.0.3
