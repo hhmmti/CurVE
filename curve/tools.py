@@ -1710,3 +1710,31 @@ def build_tool_config(registry: Dict[str, Dict[str, Any]] = None) -> Dict[str, A
     """Assemble the Converse ``toolConfig`` from a registry."""
     registry = registry if registry is not None else TOOL_REGISTRY
     return {"tools": [entry["spec"] for entry in registry.values()]}
+
+
+# --- the 9th tool: sql_query (/sql-gated, M3) ---------------------------------
+# ADDITIVE + GATED. sql_query is deliberately NOT in TOOL_REGISTRY: non-/sql turns
+# use the exact v1 8-tool config, so existing routing stays byte-identical. The engine
+# reaches for SQL_QUERY_ENTRY (dispatch) and build_sql_tool_config (model config) only
+# on a /sql turn. Imported here (not registered) so tools.py stays the single toolSpec
+# home; the pipeline lives in curve.sql_tool.
+
+from .sql_tool import SQL_QUERY_SPEC, sql_query  # noqa: E402
+
+SQL_TOOL_NAME = "sql_query"
+
+# Dispatch entry for the /sql turn (mirrors the TOOL_REGISTRY entry shape). Kept out of
+# TOOL_REGISTRY on purpose — see the note above.
+SQL_QUERY_ENTRY: Dict[str, Any] = {"spec": SQL_QUERY_SPEC, "fn": sql_query}
+
+
+def build_sql_tool_config(force: bool = True) -> Dict[str, Any]:
+    """Converse ``toolConfig`` for a /sql turn — the single sql_query tool.
+
+    ``force=True`` (the generation turn): ``toolChoice`` forces sql_query — the outer
+    model MUST call it (verified live: forced tool-use requires extended thinking OFF).
+    ``force=False`` (the follow-up narration turn): ``toolChoice`` is ``auto`` so the
+    model narrates the returned rows as final text instead of re-calling the tool.
+    """
+    choice = {"tool": {"name": SQL_TOOL_NAME}} if force else {"auto": {}}
+    return {"tools": [SQL_QUERY_SPEC], "toolChoice": choice}

@@ -21,12 +21,24 @@ from typing import Any, Callable, Dict, List, Optional
 
 from . import config
 from .prompt import CURVE_SYSTEM_PROMPT, format_setup_context
-from .tools import NON_MODEL_RESULT_KEYS, TOOL_REGISTRY, build_tool_config
+from .tools import (
+    NON_MODEL_RESULT_KEYS,
+    SQL_QUERY_ENTRY,
+    SQL_TOOL_NAME,
+    TOOL_REGISTRY,
+    build_sql_tool_config,
+    build_tool_config,
+)
 from .wrapper import CurveBedrockWrapper
 
 # Loop safety cap — "shallow multi-step" (CurVE-decisions §1 Decision 10). A hard
 # stop so a misbehaving model can't spin indefinitely.
 MAX_ITERATIONS = 5
+
+# /sql gating (M3): a question prefixed with this token is routed to the single
+# sql_query tool, FORCED via toolChoice. Net-new prefix — verified not to collide with
+# any existing engine/CLI prefix logic. The non-/sql path stays byte-identical to v1.
+SQL_PREFIX = "/sql"
 
 
 def _extract_text(message: Dict[str, Any]) -> str:
@@ -101,16 +113,39 @@ def run_curve_turn(
         ``figure`` / ``figure_ref``) for the UI/CLI to render; ``usage`` is the token
         usage summed across every converse call in this turn.
     """
+    # /sql gating: detect + strip the prefix BEFORE building the wrapper, because
+    # forced tool-use (used on a /sql turn) requires extended thinking OFF (verified
+    # live against Bedrock). A non-/sql question falls straight through unchanged.
+    sql_mode = False
+    stripped = question.lstrip()
+    if (
+        stripped == SQL_PREFIX
+        or stripped.startswith(SQL_PREFIX + " ")
+        or stripped.startswith(SQL_PREFIX + "\n")
+    ):
+        sql_mode = True
+        question = stripped[len(SQL_PREFIX):].strip()
+
     if wrapper is None:
-        wrapper = CurveBedrockWrapper(
+        wrapper_kwargs: Dict[str, Any] = dict(
             profile_name=profile_name,
             region_name=region_name,
-            enable_thinking=enable_thinking,
+            # Forced toolChoice on a /sql turn is incompatible with thinking.
+            enable_thinking=enable_thinking and not sql_mode,
         )
+        if sql_mode:
+            # Thinking-off Converse to this model rejects temperature + topP together;
+            # send only temperature. (v1's thinking-on path already omits topP.)
+            wrapper_kwargs["top_p"] = None
+        wrapper = CurveBedrockWrapper(**wrapper_kwargs)
     if tools is None:
         tools = TOOL_REGISTRY
     if system_prompt is None:
         system_prompt = CURVE_SYSTEM_PROMPT
+
+    # Dispatch registry: on a /sql turn add the 9th tool (sql_query) so the engine can
+    # run it. TOOL_REGISTRY itself is never mutated — the non-/sql config stays 8 tools.
+    dispatch = {**tools, SQL_TOOL_NAME: SQL_QUERY_ENTRY} if sql_mode else tools
 
     system = [{"text": system_prompt}]
     if session is not None:
@@ -123,8 +158,13 @@ def run_curve_turn(
     tool_trace: List[str] = []
     tool_outputs: List[Dict[str, Any]] = []
     usage = _empty_usage()
+    sql_tool_ran = False  # /sql: force the tool on the first turn, then narrate (auto)
 
     for iteration in range(max_iterations):
+        if sql_mode:
+            # Force sql_query on the generation turn; switch to auto once it has run so
+            # the model narrates the rows as final text instead of re-forcing the tool.
+            tool_config = build_sql_tool_config(force=not sql_tool_ran)
         response = wrapper.converse(
             messages=messages, system=system, tool_config=tool_config
         )
@@ -163,7 +203,7 @@ def run_curve_turn(
                 continue
             name = tool_use["name"]
             tool_trace.append(name)
-            entry = tools.get(name)
+            entry = dispatch.get(name)
             if entry is None:
                 result: Dict[str, Any] = {"error": f"unknown tool: {name}"}
             else:
@@ -183,7 +223,14 @@ def run_curve_turn(
                     # pump is picked (an honest "no connection yet" the 4b tool blocks
                     # on, never a silent default). Connection-free tools ignore it.
                     tool_input["pump"] = session.get("pump")
+                    # /sql (M3): the sql_query tool needs the FULL session (coverage
+                    # window + org/well) for the guard. Gated to that tool so the 8
+                    # v1 tools receive exactly the v1 injection set — nothing more.
+                    if name == SQL_TOOL_NAME:
+                        tool_input["session"] = session
                 result = entry["fn"](tool_input)
+                if name == SQL_TOOL_NAME:
+                    sql_tool_ran = True
 
             # The FULL envelope (incl. figure) is recorded for the UI/CLI; only the
             # model-facing fields (no figure) are returned to the model.
