@@ -29,6 +29,12 @@ smoke:                    ## Fast no-AWS regression: tests + import/config boot 
 	$(PY) -m pytest -q
 	$(PY) -c "import streamlit_app; from curve import config; print('boot OK — model=%s region=%s profile=%s' % (config.BEDROCK_MODEL_ID, config.AWS_REGION, config.AWS_PROFILE))"
 
+eval-sql-gold:            ## Validate the eval's gold SQL through guard+execute (no model calls).
+	$(PY) -m evals.sql_eval --gold-only
+
+eval-sql:                 ## LIVE sql_query execution-accuracy eval (real Bedrock + real Athena).
+	$(PY) -m evals.sql_eval
+
 clean:                    ## Remove caches and Streamlit artifacts.
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
 	rm -rf .pytest_cache

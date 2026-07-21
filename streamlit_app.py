@@ -52,8 +52,10 @@ from curve import (
 from curve.cost import estimate_cost_usd  # shared cost estimator (no logic copied)
 from curve.engine import run_curve_turn
 from curve.gate import run_tool_gate
+from curve.sql_tool import SESSION_SQL_RESULT_KEY, SESSION_SQL_RESULTS_KEY
 from curve.tools import (
     NON_MODEL_RESULT_KEYS,
+    SQL_TOOL_NAME,
     probe_connection_coverage,
     probe_delta_p_readiness,
     probe_recommendation_readiness,
@@ -78,6 +80,15 @@ _TRUST_BADGE = {
     "Proxy": ("#8250df", "🟣 Proxy"),
     "Research prototype": ("#cf222e", "🔬 Research prototype"),
 }
+
+# --- /sql surface state (M4a) -------------------------------------------------
+# M3 stashes the FULL ExecuteResult on the session record. Streamlit reruns the whole
+# script on every widget interaction (including a download click), so the full result
+# must (a) live in st.session_state to survive the rerun and (b) be keyed PER TURN —
+# and, within a turn, one payload PER EXECUTION, since the model can call sql_query
+# more than once. These two keys are new and additive.
+SQL_RESULTS_STATE_KEY = "_curve_sql_results"  # {turn_id: [payload, …] in exec order}
+SQL_TURN_SEQ_KEY = "_curve_sql_turn_seq"  # monotonic per-message id source
 
 
 # --- helpers (no core logic — composition + presentation only) ----------------
@@ -491,6 +502,165 @@ def _render_tool_envelope(name: str, envelope: Dict[str, Any]) -> None:
         )
 
 
+# --- /sql result: stash → per-turn session state → render (M4a) ---------------
+
+
+def take_sql_stashes(record: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """POP every full-result stash this turn produced, in execution order.
+
+    Popping (not reading) is deliberate, and BOTH M3 keys are cleared: a /sql turn that
+    FAILS the generation cap writes nothing, and a leftover stash would otherwise let
+    the failed turn serve the previous turn's rows. Clearing before each turn and
+    popping after means "what is in the stash" is always "what THIS turn produced, or
+    nothing".
+
+    Returns a list because one turn can execute sql_query more than once (the engine
+    forces the tool, then `auto` lets the model call it again to refine). The legacy
+    single slot is drained too so it cannot survive into a later turn.
+    """
+    if not isinstance(record, dict):
+        return []
+    record.pop(SESSION_SQL_RESULT_KEY, None)  # legacy single slot — drain, don't use
+    return record.pop(SESSION_SQL_RESULTS_KEY, None) or []
+
+
+def build_sql_download(
+    stash: Optional[Dict[str, Any]], well_id: str, turn_id: int, call_index: int = 0
+) -> Optional[Dict[str, Any]]:
+    """Encode ONE stashed FULL ExecuteResult into a CSV download payload — ONCE.
+
+    Encoding happens here (at turn completion), not at render time, so the bytes are a
+    plain value in session state: the download click reruns the script and serves those
+    bytes directly. The query is NEVER re-executed for the CSV — the Athena
+    ``query_execution_id`` carried alongside is the evidence (it is the id of the single
+    M3 execution and never changes across download clicks).
+
+    ``guarded_sql`` rides along so the render path can bind a payload to the block that
+    actually ran it, rather than trusting list position (see :func:`sql_payload_for`).
+    """
+    exec_result = (stash or {}).get("execute_result")
+    dataframe = getattr(exec_result, "dataframe", None)
+    if dataframe is None:
+        return None
+    return {
+        "csv": dataframe.to_csv(index=False).encode("utf-8"),
+        "row_count": getattr(exec_result, "row_count", len(dataframe)),
+        "query_execution_id": getattr(exec_result, "query_execution_id", None),
+        "data_scanned_bytes": getattr(exec_result, "data_scanned_bytes", 0) or 0,
+        "guarded_sql": (stash or {}).get("guarded_sql"),
+        "file_name": f"curve_sql_{well_id or 'well'}_turn{turn_id}_{call_index + 1}.csv",
+    }
+
+
+def build_sql_downloads(
+    stashes: List[Dict[str, Any]], well_id: str, turn_id: int
+) -> List[Dict[str, Any]]:
+    """One download payload per execution in this turn, in execution order."""
+    payloads = [
+        build_sql_download(stash, well_id, turn_id, index)
+        for index, stash in enumerate(stashes)
+    ]
+    return [p for p in payloads if p is not None]
+
+
+def sql_payload_for(
+    payloads: List[Dict[str, Any]], executed_sql: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Bind a rendered block to the payload whose SQL that block actually executed.
+
+    Matching on the executed SQL rather than list position is what makes a mixed turn
+    safe: a call that FAILS the generation cap still appends an envelope to
+    ``tool_outputs`` but stashes nothing, so envelope index N and stash index N drift
+    apart. Position-matching would then hand a block another query's rows — the very
+    bug this fix exists to close. Two identical executions in one turn match either
+    entry, which is harmless: same SQL, same data.
+    """
+    if not executed_sql:
+        return None
+    for payload in payloads:
+        if payload.get("guarded_sql") == executed_sql:
+            return payload
+    return None
+
+
+def sql_row_caption(row_count: int, shown: int) -> str:
+    """Honest row accounting under the inline table ("47 matched, showing 5")."""
+    if not row_count:
+        return "0 rows matched."
+    if row_count <= shown:
+        return f"{row_count} row(s) matched — all shown."
+    return f"{row_count} rows matched · showing the first {shown}."
+
+
+def _render_sql_result(
+    envelope: Dict[str, Any], turn_id: Optional[int], call_index: int = 0
+) -> None:
+    """Render one ``sql_query`` envelope — B7 (top-5 + CSV) + C10 (collapsed SQL).
+
+    Deliberately NOT a physics answer block: no trust badge, no ``st.metric`` KPI cards.
+    This is retrieval of stored columns, and mixing it with the labeled physics surface
+    would let a viewer read it as validated physics. The transparency mechanism here is
+    the **executed** SQL — the guarded/injected statement, showing the org/well scope,
+    date window and row cap the customer actually got — not the pre-guard generated SQL.
+    """
+    with st.container(border=True):
+        st.caption(
+            "🔎 **Data retrieval** — stored columns returned by a scoped SQL query. "
+            "Not a physics validation; no trust label applies."
+        )
+
+        # Honest failure (B6 cap exceeded): reason + last attempted SQL, and NOTHING
+        # that looks like a result — no table, no download, no empty success.
+        if envelope.get("error"):
+            st.error(
+                f"**Query not produced.** {envelope['error']}\n\n"
+                f"Last failure reason: `{envelope.get('last_reason') or 'unknown'}`"
+            )
+            with st.expander("Show query", expanded=False):
+                st.caption("Last attempted SQL (rejected — never executed).")
+                st.code(envelope.get("last_sql") or "-- no SQL was produced", language="sql")
+            return
+
+        rows = envelope.get("sample_rows") or []
+        row_count = int(envelope.get("row_count") or 0)
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("The query ran successfully and matched 0 rows.")
+        st.caption(sql_row_caption(row_count, len(rows)))
+
+        # C10: default-collapsed, and it holds the EXECUTED sql (``sql``), not
+        # ``generated_sql`` — the injected scoping is the point of showing it.
+        with st.expander("Show query", expanded=False):
+            st.caption(
+                "Executed SQL — organization/well scope, date window and row cap are "
+                "injected by the guard before execution."
+            )
+            st.code(envelope.get("sql") or "", language="sql")
+
+        # B7: CSV of the FULL result, served from THIS BLOCK's own stored bytes. The
+        # widget key carries the call index because one turn can render several SQL
+        # blocks, and a repeated key is a hard DuplicateWidgetID crash.
+        payload = sql_payload_for(
+            (st.session_state.get(SQL_RESULTS_STATE_KEY) or {}).get(turn_id) or [],
+            envelope.get("sql"),
+        )
+        if payload is not None:
+            st.download_button(
+                "⬇ Download full result (CSV)",
+                data=payload["csv"],
+                file_name=payload["file_name"],
+                mime="text/csv",
+                key=f"sql_download_{turn_id}_{call_index}",
+            )
+            st.caption(
+                f"{payload['row_count']} row(s) · served from this turn's stored "
+                f"result — downloading does not re-run the query · Athena query "
+                f"`{payload['query_execution_id']}` · "
+                f"{payload['data_scanned_bytes']:,} bytes scanned."
+            )
+
+
 def _render_answer(entry: Dict[str, Any], dev_mode: bool) -> None:
     """Render one assistant turn: per-tool badge + KPI + figure + narration (+ dev panel)."""
     # Render each physics tool the loop called, IN TOOL-TRACE ORDER (tool_outputs is
@@ -500,10 +670,21 @@ def _render_answer(entry: Dict[str, Any], dev_mode: bool) -> None:
     # renders the KPI only when a renderer exists, always renders an available tool's
     # figure, and draws no chart/placeholder for a blocked/not-ready tool (its status is
     # surfaced as text + in the narration).
+    # One turn can call sql_query more than once, so SQL blocks are numbered within the
+    # turn — that index makes each block's download widget key unique.
+    sql_call_index = 0
     for output in entry.get("tool_outputs") or []:
         name = output.get("name")
         envelope = output.get("result")
-        if isinstance(envelope, dict):
+        if not isinstance(envelope, dict):
+            continue
+        # /sql (M4a): the retrieval tool has its own, deliberately non-physics block —
+        # it carries no gate status/trust label, so the physics renderer would report it
+        # as a status-less "blocked" warning. Every other tool is untouched.
+        if name == SQL_TOOL_NAME:
+            _render_sql_result(envelope, entry.get("sql_turn_id"), sql_call_index)
+            sql_call_index += 1
+        else:
             _render_tool_envelope(name, envelope)
 
     # The one synthesizing narration paragraph (answer-level).
@@ -988,19 +1169,39 @@ def render_page() -> None:
 
     question = st.chat_input(
         "Ask about this well's production, water cut/GOR, ΔP, or the ML "
-        "recommendation (comparison, affinity check, energy efficiency)…"
+        "recommendation (comparison, affinity check, energy efficiency)… "
+        "— or prefix /sql for a direct data lookup"
     )
     if question:
         st.session_state["chat"].append({"role": "user", "text": question})
         with st.chat_message("user"):
             st.markdown(question)
         with st.chat_message("assistant"):
+            # /sql (M4a): clear M3's full-result stashes BEFORE the turn, so whatever is
+            # there afterwards belongs to THIS turn (a cap-exceeded turn writes nothing
+            # and must not inherit the previous query's rows).
+            take_sql_stashes(record)
+            turn_id = st.session_state.get(SQL_TURN_SEQ_KEY, 0) + 1
+            st.session_state[SQL_TURN_SEQ_KEY] = turn_id
             with st.spinner("Running the CurVE loop…"):
                 started = time.time()
                 result = run_curve_turn(
                     question, session=record, profile_name=profile
                 )
                 elapsed = time.time() - started
+            # /sql (M4a): move this turn's full results out of the session-record stash
+            # and into per-turn session state — ONE payload per execution. Keying by
+            # turn_id fixes the cross-turn collision (message 1 keeps serving message 1's
+            # rows); carrying a list fixes the intra-turn one (a turn that runs sql_query
+            # twice keeps both results instead of the second clobbering the first).
+            # Encoded once here; a download click just replays the bytes.
+            sql_downloads = build_sql_downloads(
+                take_sql_stashes(record), record.get("well_id", ""), turn_id
+            )
+            if sql_downloads:
+                st.session_state.setdefault(SQL_RESULTS_STATE_KEY, {})[
+                    turn_id
+                ] = sql_downloads
             # Rendering is driven by tool_outputs — each physics tool the loop called.
             entry = {
                 "role": "assistant",
@@ -1011,6 +1212,8 @@ def render_page() -> None:
                 "iterations": result.get("iterations"),
                 "usage": result.get("usage"),
                 "elapsed_s": elapsed,
+                # Per-message handle into SQL_RESULTS_STATE_KEY (None on non-/sql turns).
+                "sql_turn_id": turn_id,
             }
             st.session_state["chat"].append(entry)
             _render_answer(entry, dev_mode)

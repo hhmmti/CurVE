@@ -39,8 +39,19 @@ from curve.wrapper import CurveBedrockWrapper
 MAX_SQL_GENERATIONS = 2
 
 # Where the full ExecuteResult is stashed on the session record so M4 can offer CSV
-# with no re-run. M3 owns this key; M4 reads it.
+# with no re-run. M3 owns these keys; M4 reads them.
+#
+# Two keys, deliberately:
+#   * SESSION_SQL_RESULT_KEY  — the LAST execution only (original M3 contract; the eval
+#     harness and any single-result consumer still read this).
+#   * SESSION_SQL_RESULTS_KEY — an ORDERED LIST, one entry per execution in this turn.
+#     Added after a live /sql turn showed the outer model calling sql_query TWICE in one
+#     turn (forced on iteration 1, then `auto` lets it call again to refine). The single
+#     slot held only the second execution, so the first rendered block offered the second
+#     query's CSV under the second query's Athena id. A one-deep slot cannot represent an
+#     N-execution turn; the list can.
 SESSION_SQL_RESULT_KEY = "sql_last_result"
+SESSION_SQL_RESULTS_KEY = "sql_results"
 
 
 # --- generation prompt --------------------------------------------------------
@@ -56,7 +67,7 @@ SQL_GEN_SYSTEM_PROMPT = (
 # The hard rules appended after the schema block. These enforce the M2 carry-forwards
 # so the model does not fight the guard (org/well auto-injected; join on observation_day;
 # fully-qualify; no LIMIT/date; stored columns only). No physics formulas appear here.
-_GENERATE_RULES = """\
+_GENERATE_RULES = f"""\
 GENERATION RULES — follow every one EXACTLY:
 1. Output a SINGLE read-only query: one SELECT, or one WITH … SELECT. No INSERT /
    UPDATE / DELETE / DDL, no semicolon-separated or stacked statements.
@@ -66,9 +77,15 @@ GENERATION RULES — follow every one EXACTLY:
    a JOIN … ON. Org and well scoping is injected automatically. Emitting one is rejected.
 4. To relate two scoped tables (e.g. telemetry and production), JOIN ON observation_day
    ONLY. Do NOT join on well_id or organization_id — that is rejected.
-5. Do NOT add a LIMIT. Do NOT add an observation_day date filter unless the question
-   names a specific window. The row cap, org/well scope, and default date window are
-   all injected for you.
+5. Do NOT add a LIMIT to bound cost or "just to be safe" — a row cap of
+   {config.SQL_QUERY_LIMIT_CAP} is injected for you automatically. EXCEPTION: when the
+   question itself names a number of rows ("the top 5 pumps", "the 3 highest days",
+   "the latest reading", "the single largest"), DO write an explicit
+   LIMIT <that number> — it is part of the correct answer, not a cost guard. Such a
+   LIMIT is accepted as long as it is a plain integer literal that is not greater than
+   {config.SQL_QUERY_LIMIT_CAP}; never write LIMIT ALL, a parameter, or an expression.
+   Do NOT add an observation_day date filter unless the question names a specific
+   window. The org/well scope and the default date window are injected for you.
 6. Retrieve STORED COLUMNS only. Do not attempt physics-derived quantities (best-
    efficiency-point position, off-design variance, pump efficiency, affinity-law
    scaling, ideal-curve reconstruction) — those are NOT columns in these tables. If the
@@ -248,10 +265,15 @@ def _stash_result(
     guarded: Any,
     exec_result: Any,
 ) -> None:
-    """Stash the FULL ExecuteResult on the session so M4 can offer CSV with no re-run."""
+    """Stash the FULL ExecuteResult on the session so M4 can offer CSV with no re-run.
+
+    Written to BOTH the last-execution slot (original contract) and the per-execution
+    list, so a turn that runs sql_query more than once keeps every result rather than
+    letting the later execution clobber the earlier one.
+    """
     if session is None:
         return
-    session[SESSION_SQL_RESULT_KEY] = {
+    record = {
         "question": question,
         "generated_sql": generated_sql,
         "guarded_sql": guarded.sql,
@@ -259,6 +281,8 @@ def _stash_result(
         "execute_result": exec_result,  # holds the full DataFrame + metadata
         "query_execution_id": exec_result.query_execution_id,
     }
+    session[SESSION_SQL_RESULT_KEY] = record
+    session.setdefault(SESSION_SQL_RESULTS_KEY, []).append(record)
     # Persist through the active store (in-memory dict today; DDB later).
     try:
         if session.get("session_id"):
